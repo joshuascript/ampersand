@@ -1,0 +1,251 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+
+namespace Ampersand;
+
+/// <summary>
+/// Resolves the engine's shared-library dependencies on the host AND inside the
+/// Steam runtime, because the two are different sets.
+///
+/// Checking only the host is a trap: every binary in game/bin/linuxsteamrt64
+/// resolves cleanly inside sniper with nothing missing, while the libraries
+/// that actually stop the engine booting - libunwind and OpenSSL 3, needed by
+/// the .NET runtime - are missing from the CONTAINER. A host-only check reports
+/// all-clear on a setup that cannot start.
+/// </summary>
+internal static class DependencyCheck
+{
+	/// <summary>
+	/// One ldd sweep, run as a single shell command so the container is
+	/// entered once rather than once per binary.
+	/// </summary>
+	private const string SweepScript = """
+		# Mirror _common.sh: the shim cache must join the path INSIDE the
+		# container, because LD_LIBRARY_PATH set outside is discarded by
+		# pressure-vessel. Without this the sweep reports what sniper lacks
+		# natively rather than what a real launch actually sees.
+		LD_LIBRARY_PATH="$SBOX_NATIVE${SBOX_SNIPER_COMPAT:+:$SBOX_SNIPER_COMPAT}"
+		export LD_LIBRARY_PATH
+		total=0
+		bad=0
+		for dir in "$SBOX_NATIVE" "$SBOX_DOTNET"; do
+			[ -d "$dir" ] || continue
+			for f in "$dir"/*; do
+				[ -f "$f" ] || continue
+				case "$f" in *.sh|*.json|*.txt|*.pdb) continue;; esac
+				out=$( ldd "$f" 2>/dev/null ) || continue
+				case "$out" in *"not a dynamic executable"*) continue;; esac
+				total=$(( total + 1 ))
+				miss=$( printf '%s\n' "$out" | awk '/not found/ { printf "%s ", $1 }' )
+				if [ -n "$miss" ]; then
+					bad=$(( bad + 1 ))
+					echo "MISS|$( basename "$f" )|$miss"
+				fi
+			done
+		done
+		echo "SUMMARY|$total|$bad"
+		""";
+
+	public static void Run( string repoRoot, Action<string> emit )
+	{
+		var native = Path.Combine( repoRoot, "game", "bin", "linuxsteamrt64" );
+		var dotnet = FindDotnetRuntime( repoRoot );
+
+		emit( Ansi.Bold + Ansi.White + "=== dependency check ===" + Ansi.NoBold + Ansi.Reset );
+		emit( "" );
+		emit( Ansi.Dim + "native   " + Ansi.Reset + native
+			+ ( Directory.Exists( native ) ? "" : Ansi.Red + "   (MISSING)" + Ansi.Reset ) );
+		emit( Ansi.Dim + "dotnet   " + Ansi.Reset
+			+ ( dotnet ?? Ansi.Red + "not found - run ./bootstrap.sh" + Ansi.Reset ) );
+		emit( "" );
+
+		// --- host ---------------------------------------------------------
+		emit( Ansi.Bold + Ansi.Cyan + "--- host ---" + Ansi.NoBold + Ansi.Reset );
+		var hostCommand = new List<string> { "/bin/sh", "-c", SweepScript };
+		ReportSweep( hostCommand, native, dotnet, string.Empty, emit );
+		emit( "" );
+
+		// --- container ----------------------------------------------------
+		emit( Ansi.Bold + Ansi.Cyan + "--- steam runtime (sniper) ---" + Ansi.NoBold + Ansi.Reset );
+
+		var install = SniperRuntime.Find();
+		if ( install is null )
+		{
+			emit( Ansi.Red + "  sniper is not installed" + Ansi.Reset
+				+ " - steam steam://install/" + SniperRuntime.SteamAppId );
+			emit( "" );
+			ReportShimCache( emit );
+			return;
+		}
+
+		emit( Ansi.Dim + "  runtime  " + Ansi.Reset + install.Path );
+		emit( Ansi.Dim + "  version  " + Ansi.Reset + install.Version );
+
+		if ( !SniperRuntime.CheckRequirements( install, out var problems ) )
+		{
+			emit( Ansi.Red + "  this host cannot start a container:" + Ansi.Reset );
+
+			foreach ( var problem in problems )
+				emit( Ansi.Yellow + "    " + problem + Ansi.Reset );
+
+			emit( "" );
+			ReportShimCache( emit );
+			return;
+		}
+
+		emit( Ansi.Green + "  requirements OK" + Ansi.Reset );
+
+		var cache = SniperCompat.CacheDirectory;
+		var sniperCommand = new List<string>
+		{
+			install.RunScript,
+			"--filesystem=" + cache,
+			"--",
+			"/bin/sh",
+			"-c",
+			SweepScript
+		};
+
+		ReportSweep( sniperCommand, native, dotnet, cache, emit );
+		emit( "" );
+		ReportShimCache( emit );
+	}
+
+	private static void ReportSweep(
+		IReadOnlyList<string> command, string native, string? dotnet, string compat, Action<string> emit )
+	{
+		var info = new ProcessStartInfo
+		{
+			FileName = command[0],
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+			UseShellExecute = false
+		};
+
+		for ( var i = 1; i < command.Count; i++ )
+			info.ArgumentList.Add( command[i] );
+
+		info.Environment["SBOX_NATIVE"] = native;
+		info.Environment["SBOX_DOTNET"] = dotnet ?? string.Empty;
+		info.Environment["SBOX_SNIPER_COMPAT"] = compat;
+
+		string output;
+
+		try
+		{
+			using var process = Process.Start( info );
+
+			if ( process is null )
+			{
+				emit( Ansi.Red + "  could not run the sweep" + Ansi.Reset );
+				return;
+			}
+
+			output = process.StandardOutput.ReadToEnd();
+			process.WaitForExit( 120000 );
+		}
+		catch ( Exception e )
+		{
+			emit( Ansi.Red + "  sweep failed - " + e.Message + Ansi.Reset );
+			return;
+		}
+
+		var found = false;
+
+		foreach ( var line in output.Split( '\n' ) )
+		{
+			if ( line.StartsWith( "MISS|", StringComparison.Ordinal ) )
+			{
+				var parts = line.Split( '|' );
+				if ( parts.Length >= 3 )
+				{
+					var libraries = parts[2].Trim();
+					var optional = AllOptional( libraries );
+
+					if ( !optional )
+						found = true;
+
+					emit( optional
+						? Ansi.Dim + "  optional " + parts[1].PadRight( 42 ) + libraries + Ansi.Reset
+						: Ansi.Red + "  MISSING  " + Ansi.Reset + parts[1].PadRight( 42 )
+							+ Ansi.Yellow + libraries + Ansi.Reset );
+				}
+			}
+			else if ( line.StartsWith( "SUMMARY|", StringComparison.Ordinal ) )
+			{
+				var parts = line.Split( '|' );
+				if ( parts.Length >= 3 )
+				{
+					emit( Ansi.Dim + "  checked " + parts[1] + " binaries, " + parts[2].Trim()
+						+ " with unresolved libraries" + Ansi.Reset );
+				}
+			}
+		}
+
+		if ( !found )
+			emit( Ansi.Green + "  nothing missing that matters" + Ansi.Reset );
+	}
+
+	/// <summary>
+	/// liblttng-ust is the CoreCLR tracing provider. .NET skips it silently
+	/// when absent, and neither sniper nor most desktops ship it, so reporting
+	/// it as a failure only sends people chasing a non-problem.
+	/// </summary>
+	private static readonly string[] OptionalLibraries = { "liblttng-ust" };
+
+	private static bool AllOptional( string libraries )
+	{
+		foreach ( var library in libraries.Split( ' ', StringSplitOptions.RemoveEmptyEntries ) )
+		{
+			var known = false;
+
+			foreach ( var optional in OptionalLibraries )
+			{
+				if ( library.StartsWith( optional, StringComparison.Ordinal ) )
+				{
+					known = true;
+					break;
+				}
+			}
+
+			if ( !known )
+				return false;
+		}
+
+		return true;
+	}
+
+	private static void ReportShimCache( Action<string> emit )
+	{
+		emit( Ansi.Bold + Ansi.Cyan + "--- sniper compat cache ---" + Ansi.NoBold + Ansi.Reset );
+		emit( Ansi.Dim + "  " + SniperCompat.CacheDirectory + Ansi.Reset );
+
+		foreach ( var library in SniperCompat.RequiredLibraries )
+		{
+			var path = Path.Combine( SniperCompat.CacheDirectory, library );
+			emit( File.Exists( path )
+				? Ansi.Green + "  present  " + Ansi.Reset + library
+				: Ansi.Red + "  ABSENT   " + Ansi.Reset + library );
+		}
+
+		emit( "" );
+		emit( Ansi.Dim + "Sniper ships neither libunwind nor OpenSSL 3, so these are copied from the" );
+		emit( "host on first containerised launch. Without them the engine fails with" );
+		emit( "\"HRESULT: 0x80008088\" or a TypeInitializationException in Interop.Crypto." + Ansi.Reset );
+	}
+
+	private static string? FindDotnetRuntime( string repoRoot )
+	{
+		var shared = Path.Combine( repoRoot, "game", "dotnet", "shared", "Microsoft.NETCore.App" );
+
+		if ( !Directory.Exists( shared ) )
+			return null;
+
+		var versions = Directory.GetDirectories( shared );
+		Array.Sort( versions, StringComparer.Ordinal );
+
+		return versions.Length > 0 ? versions[^1] : null;
+	}
+}
