@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -134,6 +135,12 @@ internal sealed class ProcessRunner
 			catch ( OperationCanceledException )
 			{
 				// Stop() closed it.
+			}
+			catch ( IOException )
+			{
+				// Reading a pty master after the child exits raises EIO on
+				// Linux. That IS the normal end of a session, not a fault, so
+				// it must not surface as an error line on every clean exit.
 			}
 			catch ( Exception e )
 			{

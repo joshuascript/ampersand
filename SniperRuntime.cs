@@ -211,6 +211,21 @@ internal static class SniperRuntime
 			problems.Add( "    sudo sysctl -w user.max_user_namespaces=15000" );
 		}
 
+		// The probe runs `bwrap --ro-bind ... true`. If bwrap starts but cannot
+		// exec, the namespace came up while the filesystem did not - a different
+		// fault from the userns switches above, and none of those hints apply.
+		if ( output.Contains( "execvp", StringComparison.OrdinalIgnoreCase )
+			|| output.Contains( "No such file or directory", StringComparison.Ordinal ) )
+		{
+			problems.Add( "bwrap started but could not execute inside the sandbox, so the" );
+			problems.Add( "container has no usable filesystem. This is NOT the userns switches above." );
+			problems.Add( "Check by hand:" );
+			problems.Add( "    bwrap --ro-bind / / true      # should print nothing and exit 0" );
+			problems.Add( "Common causes: running inside another container (distrobox, toolbox," );
+			problems.Add( "Flatpak), an immutable/atomic distro, or an incomplete runtime download" );
+			problems.Add( "- verify " + install.Path + " contains a sniper_platform_* directory." );
+		}
+
 		if ( problems.Count == 0 )
 			problems.Add( "steam-runtime-check-requirements failed with exit code " + exitCode );
 
