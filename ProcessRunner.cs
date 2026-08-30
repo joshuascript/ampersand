@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,14 +21,27 @@ namespace Ampersand;
 /// longer guess severity from text.
 ///
 /// forkpty() makes the child a session leader, so its pid IS its process group.
-/// That is what Stop signals - reaching sbox-launcher after sbox-dev hands off,
-/// and the engine behind bwrap under the Steam runtime.
+/// That is what Stop signals - reaching sbox-launcher after sbox-dev hands off.
+///
+/// Under the Steam runtime the direct child is steam-runtime-launch-client and the
+/// engine is not in its process group at all, so the signal arrives indirectly:
+/// launch-client watches signals on a signalfd and relays them to the service as
+/// SendSignal. VERIFIED - SIGTERM to launch-client reached a remote child's TERM
+/// handler, and its exit code 42 came back out through launch-client.
 /// </summary>
 internal sealed class ProcessRunner
 {
 	private IPtyConnection? connection;
 	private Process? detachedProcess;
 	private CancellationTokenSource? reader;
+
+	/// <summary>
+	/// What the child is told it is talking to. Shared, because the containerised
+	/// path has to hand this over a second time as a --env argument: env does not
+	/// cross the launcher service by inheritance, and an engine with no TERM emits
+	/// no colour.
+	/// </summary>
+	public const string Term = "xterm-256color";
 
 	public string Name { get; }
 	public bool IsRunning { get; private set; }
@@ -78,17 +92,25 @@ internal sealed class ProcessRunner
 		var environment = new Dictionary<string, string>( extraEnv )
 		{
 			// Without a sane TERM the engine cannot decide what it may emit.
-			["TERM"] = "xterm-256color"
+			["TERM"] = Term
 		};
 
 		var options = new PtyOptions
 		{
-			Name = "xterm-256color",
+			Name = Term,
 			Cols = Math.Max( columns, 20 ),
 			Rows = Math.Max( rows, 5 ),
 			Cwd = workingDirectory,
 			App = command[0],
-			CommandLine = new List<string>( command ).ToArray(),
+
+			// ARGUMENTS ONLY. The library builds argv as App followed by
+			// CommandLine, so including command[0] here hands the child its own
+			// path a second time as argv[1]. That was survivable while every
+			// target was a shell script - the engine ignored the extra argument -
+			// but steam-runtime-launch-client parses with GLib, which stops
+			// reading options at the first non-option, so a duplicated argv[0]
+			// makes it reject its own --alongside-steam as missing.
+			CommandLine = command.Skip( 1 ).ToArray(),
 			Environment = environment
 		};
 

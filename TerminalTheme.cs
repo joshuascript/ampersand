@@ -57,6 +57,15 @@ internal static class TerminalTheme
 
 	/// <summary>Terminal output. The deepest surface.</summary>
 	public static readonly IBrush Background = new SolidColorBrush( Color.FromRgb( 0x15, 0x17, 0x1F ) );
+
+	/// <summary>
+	/// Drag-selection in the output pane. Translucent, so the text underneath
+	/// stays readable and the highlight is obvious against the deepest surface.
+	/// An opaque fill this close to the pane's own colour is why selecting text
+	/// used to look like nothing had happened at all.
+	/// </summary>
+	public static readonly IBrush Selection = new SolidColorBrush( Color.FromArgb( 0x66, 0x4F, 0xC1, 0xFF ) );
+
 	public static readonly IBrush Normal = new SolidColorBrush( Color.FromRgb( 0xD4, 0xD4, 0xD4 ) );
 
 	// The PreJit dumps are 92% of a startup. Pushing them back is the point.

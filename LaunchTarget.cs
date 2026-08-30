@@ -25,6 +25,25 @@ internal sealed class LaunchTarget : INotifyPropertyChanged
 	/// <summary>Per-target: run in the user's terminal instead of the pane.</summary>
 	public bool Detach { get; set; }
 
+	/// <summary>
+	/// True from the double-click until the process is actually spawned. The
+	/// containerised path can wait minutes on Steam starting, and Runner.IsRunning
+	/// is still false throughout - so without this a second double-click would
+	/// start a second launch of the same target.
+	/// </summary>
+	public bool Preparing { get; set; }
+
+	/// <summary>
+	/// The grid the pane is currently showing. The control measures its own
+	/// cell and resizes on every layout pass, so this is the only honest answer
+	/// to "how wide is this terminal" - and it is what the pty must be opened
+	/// at, so the engine formats for the width that is actually on screen.
+	/// </summary>
+	public (int Cols, int Rows) Grid => (Terminal.Model.Terminal.Cols, Terminal.Model.Terminal.Rows);
+
+	/// <summary>Last grid size handed to the pty. See the SizeChanged handler.</summary>
+	private (int Cols, int Rows) lastResize;
+
 	public event PropertyChangedEventHandler? PropertyChanged;
 
 	public LaunchTarget( string name, string scriptFile, TerminalControl terminal )
@@ -40,8 +59,19 @@ internal sealed class LaunchTarget : INotifyPropertyChanged
 		// Keystrokes go back to the child, and the child is told when the grid
 		// changes shape - the two halves of behaving like a terminal.
 		Terminal.Model.UserInput += ( _, e ) => Runner.Write( e.Data );
-		Terminal.Model.SizeChanged += ( _, _ ) =>
-			Runner.Resize( Terminal.Model.Terminal.Cols, Terminal.Model.Terminal.Rows );
+
+		// SizeChanged fires on every pixel of a resize drag, including the ones
+		// too small to change the grid, and the args already carry the values -
+		// so forward only real changes rather than reaching back through the
+		// model for them and sending a TIOCSWINSZ and a SIGWINCH per frame.
+		Terminal.Model.SizeChanged += ( _, e ) =>
+		{
+			if ( (e.Cols, e.Rows) == lastResize )
+				return;
+
+			lastResize = (e.Cols, e.Rows);
+			Runner.Resize( e.Cols, e.Rows );
+		};
 	}
 
 	public string Display

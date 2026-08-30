@@ -20,8 +20,11 @@ namespace Ampersand;
 
 internal sealed class MainWindow : Window
 {
-	// The pty is opened at this size. The engine only uses it for wrapping, and
-	// the control scrolls independently, so a fixed geometry is adequate.
+	// The grid a terminal is CONSTRUCTED with, before the control has been laid
+	// out and measured its own cell. It is transient - the first layout pass
+	// overwrites it (a 1040x660 window measures 107x16) - so nothing may be
+	// derived from it. The pty is opened at the terminal's live size instead;
+	// see Launch().
 	private const int Columns = 200;
 	private const int Rows = 50;
 
@@ -98,7 +101,7 @@ internal sealed class MainWindow : Window
 
 			ShowSelected();
 
-			if ( selected is { Runner.IsRunning: false } target )
+			if ( selected is { Runner.IsRunning: false, Preparing: false } target )
 				Launch( target );
 		};
 
@@ -236,15 +239,19 @@ internal sealed class MainWindow : Window
 		// THE control does not create its own model - the host must. Without
 		// this assignment Model stays null forever and every Feed is silently
 		// discarded, which is exactly what produced a blank pane.
+		//
+		// Cols and Rows are the construction size only - the control measures
+		// its own cell and resizes the grid on the first layout pass.
+		//
+		// There is deliberately no ReflowOnResize here. The library exposes it
+		// and it reads like the flag that governs this, but it is inert: it is
+		// never forwarded to the engine, and XTerm.NET 1.0.12 has no reflow to
+		// forward it to. Setting it taught us nothing and cost a diagnosis.
 		var model = new TerminalControlModel( new TerminalOptions
 		{
 			Cols = Columns,
 			Rows = Rows,
-			Scrollback = 10000,
-
-			// The library's own guidance: stops full-screen TUIs corrupting on
-			// resize, which matters for sbox-server's status overlay.
-			ReflowOnResize = false
+			Scrollback = 10000
 		} );
 
 		var terminal = new TerminalControl
@@ -253,11 +260,18 @@ internal sealed class MainWindow : Window
 			FontFamily = "DejaVu Sans Mono",
 			FontSize = 12,
 			Background = TerminalTheme.Background,
-			SelectionBrush = TerminalTheme.SidebarHover
+			SelectionBrush = TerminalTheme.Selection
 		};
 
 		var copy = new MenuItem { Header = "Copy" };
 		copy.Click += async ( _, _ ) => await terminal.CopySelectionAsync();
+
+		// CopySelectionAsync is a silent no-op with nothing selected, so the
+		// item has to say so rather than looking like it did nothing.
+		copy.Bind( IsEnabledProperty, terminal.GetObservable( TerminalControl.HasSelectionProperty ) );
+
+		var paste = new MenuItem { Header = "Paste" };
+		paste.Click += async ( _, _ ) => await terminal.PasteFromClipboardAsync();
 
 		var selectAll = new MenuItem { Header = "Select All" };
 		selectAll.Click += ( _, _ ) => terminal.SelectAll();
@@ -267,10 +281,13 @@ internal sealed class MainWindow : Window
 
 		var menu = new ContextMenu();
 		menu.Items.Add( copy );
+		menu.Items.Add( paste );
 		menu.Items.Add( selectAll );
 		menu.Items.Add( new Separator() );
 		menu.Items.Add( clear );
 		terminal.ContextMenu = menu;
+
+		TerminalClipboard.Attach( terminal );
 
 		return terminal;
 	}
@@ -350,12 +367,13 @@ internal sealed class MainWindow : Window
 		// Detach cannot be changed once running, because the stream is already
 		// committed to either the pty or the emulator.
 		detachToggle.IsChecked = target.Detach;
-		detachToggle.IsEnabled = SystemTerminal.Detect() is not null && !target.Runner.IsRunning;
+		detachToggle.IsEnabled = SystemTerminal.Detect() is not null
+			&& !target.Runner.IsRunning && !target.Preparing;
 
 		updatingCheckbox = false;
 	}
 
-	private void Launch( LaunchTarget target )
+	private async void Launch( LaunchTarget target )
 	{
 		var root = RepoRoot.Find();
 		if ( root is null )
@@ -376,21 +394,37 @@ internal sealed class MainWindow : Window
 		var env = new Dictionary<string, string> { ["SBOX_REPO_ROOT"] = root };
 		var command = new List<string>();
 
-		if ( target.UseSniper )
+		// Held across the await below, not just the spawn: PrepareSniper can sit
+		// for minutes waiting on Steam, and nothing else marks the target busy.
+		target.Preparing = true;
+
+		try
 		{
-			if ( !PrepareSniper( target, script, command, env ) )
-				return;
+			if ( target.UseSniper )
+			{
+				if ( !await PrepareSniper( target, root, script, command, env ) )
+					return;
+			}
+			else
+			{
+				command.Add( script );
+			}
 		}
-		else
+		finally
 		{
-			command.Add( script );
+			target.Preparing = false;
 		}
 
 		target.Append( "$ " + string.Join( " ", command ) );
 
 		try
 		{
-			target.Runner.Start( command, root, env, target.Detach, Columns, Rows );
+			// The pane has already been laid out and measured, so this is the
+			// grid on screen. Opening the pty at the constant instead would
+			// have the engine format for 200 columns inside a 107-column
+			// window, and nothing would tell it otherwise until a resize.
+			var grid = target.Grid;
+			target.Runner.Start( command, root, env, target.Detach, grid.Cols, grid.Rows );
 		}
 		catch ( Exception e )
 		{
@@ -403,8 +437,21 @@ internal sealed class MainWindow : Window
 		UpdateToggles( target );
 	}
 
-	private static bool PrepareSniper(
-		LaunchTarget target, string script, List<string> command, Dictionary<string, string> env )
+	/// <summary>
+	/// Builds the containerised command, and refuses to build one at all unless
+	/// Steam is up.
+	///
+	/// Steam running is a hard requirement, not a preference: the container is
+	/// entered through the launcher service running alongside the client, because
+	/// that is the only context in which the runtime's own bwrap is allowed to
+	/// create a user namespace. See SteamLauncherService.
+	/// </summary>
+	private async Task<bool> PrepareSniper(
+		LaunchTarget target,
+		string root,
+		string script,
+		List<string> command,
+		Dictionary<string, string> env )
 	{
 		var install = SniperRuntime.Find();
 
@@ -417,19 +464,41 @@ internal sealed class MainWindow : Window
 
 		target.Append( "ampersand: runtime " + install.Path + " (" + install.Version + ")" );
 
-		if ( !SniperRuntime.CheckRequirements( install, out var problems ) )
+		// Everything below shells out or copies megabytes, so none of it may run
+		// on the UI thread - the probe alone can sit five seconds. This is the
+		// reason the method is async; awaiting a blocking call would only move
+		// the freeze, not remove it.
+		if ( !await Task.Run( () => SteamLauncherService.IsAvailable( install ) )
+			&& !await StartSteamFor( target, install ) )
+		{
+			return false;
+		}
+
+		var requirements = await Task.Run( () =>
+		{
+			var met = SniperRuntime.CheckRequirements( install, out var found );
+			return (Met: met, Problems: found);
+		} );
+
+		if ( !requirements.Met )
 		{
 			target.Append( "ampersand: this host cannot start a pressure-vessel container." );
 
-			foreach ( var problem in problems )
+			foreach ( var problem in requirements.Problems )
 				target.Append( "    " + problem );
 
 			return false;
 		}
 
-		if ( !SniperCompat.Ensure( out var compatProblems ) )
+		var compat = await Task.Run( () =>
 		{
-			foreach ( var problem in compatProblems )
+			var ready = SniperCompat.Ensure( out var found );
+			return (Ready: ready, Problems: found);
+		} );
+
+		if ( !compat.Ready )
+		{
+			foreach ( var problem in compat.Problems )
 				target.Append( "ampersand: " + problem );
 
 			return false;
@@ -437,14 +506,69 @@ internal sealed class MainWindow : Window
 
 		var cache = SniperCompat.CacheDirectory;
 
-		command.Add( install.RunScript );
-		command.Add( "--filesystem=" + cache );
-		command.Add( "--" );
-		command.Add( script );
-
 		env["SBOX_IN_SNIPER"] = "1";
 		env["SBOX_SNIPER_COMPAT"] = cache;
 
+		// TERM is added here rather than left to ProcessRunner: that one is set on
+		// launch-client's own environment, and the child does not inherit it.
+		var passed = new Dictionary<string, string>( env ) { ["TERM"] = ProcessRunner.Term };
+
+		command.AddRange( SteamLauncherService.Wrap(
+			install,
+			new[] { install.RunScript, "--filesystem=" + cache, "--", script },
+			root,
+			passed ) );
+
+		return true;
+	}
+
+	/// <summary>
+	/// Offers to start Steam, then waits for its launcher service. Declining, or a
+	/// Steam that never comes up, aborts the launch - there is no second route
+	/// into the container to fall back to.
+	/// </summary>
+	private async Task<bool> StartSteamFor( LaunchTarget target, SniperInstall install )
+	{
+		target.Append( "ampersand: Steam is not running." );
+		target.Append( "    The Steam runtime can only be entered under Steam's own AppArmor profile," );
+		target.Append( "    so the client has to be up. See docs/sniper-userns-apparmor.md." );
+
+		var start = await ConfirmDialog.Show(
+			this,
+			"Steam is not running",
+			"s&box can only be launched in the Steam runtime while the Steam client is "
+				+ "running - the container is entered through Steam's own launcher service.\n\n"
+				+ "Start Steam now and wait for it?",
+			"Start Steam",
+			"Cancel" );
+
+		if ( !start )
+		{
+			target.Append( "ampersand: launch cancelled." );
+			return false;
+		}
+
+		if ( !SteamLauncherService.TryStartSteam( out var problem ) )
+		{
+			target.Append( "ampersand: " + problem );
+			return false;
+		}
+
+		target.Append( "ampersand: starting Steam..." );
+
+		var ready = await Task.Run( () => SteamLauncherService.WaitForService(
+			install,
+			TimeSpan.FromMinutes( 2 ),
+			line => Dispatcher.UIThread.Post( () => target.Append( "ampersand: " + line ) ) ) );
+
+		if ( !ready )
+		{
+			target.Append( "ampersand: Steam's launcher service did not appear - launch cancelled." );
+			target.Append( "    Check Steam is signed in, then try again." );
+			return false;
+		}
+
+		target.Append( "ampersand: Steam is up." );
 		return true;
 	}
 

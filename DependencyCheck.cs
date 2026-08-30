@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 
 namespace Ampersand;
 
@@ -61,10 +62,18 @@ internal static class DependencyCheck
 			+ ( dotnet ?? Ansi.Red + "not found - run ./bootstrap.sh" + Ansi.Reset ) );
 		emit( "" );
 
+		var sweep = new List<string> { "/bin/sh", "-c", SweepScript };
+
+		var env = new Dictionary<string, string>
+		{
+			["SBOX_NATIVE"] = native,
+			["SBOX_DOTNET"] = dotnet ?? string.Empty,
+			["SBOX_SNIPER_COMPAT"] = string.Empty
+		};
+
 		// --- host ---------------------------------------------------------
 		emit( Ansi.Bold + Ansi.Cyan + "--- host ---" + Ansi.NoBold + Ansi.Reset );
-		var hostCommand = new List<string> { "/bin/sh", "-c", SweepScript };
-		ReportSweep( hostCommand, native, dotnet, string.Empty, emit );
+		ReportSweep( sweep, env, emit );
 		emit( "" );
 
 		// --- container ----------------------------------------------------
@@ -83,6 +92,22 @@ internal static class DependencyCheck
 		emit( Ansi.Dim + "  runtime  " + Ansi.Reset + install.Path );
 		emit( Ansi.Dim + "  version  " + Ansi.Reset + install.Version );
 
+		// The container is only reachable through Steam's launcher service, so with
+		// Steam down there is nothing to sweep - and saying so beats a wall of
+		// "not found" that looks like a broken install.
+		if ( !SteamLauncherService.IsAvailable( install ) )
+		{
+			emit( Ansi.Red + "  Steam is not running" + Ansi.Reset
+				+ " - the container is entered through Steam's launcher" );
+			emit( Ansi.Dim + "  service, so this half cannot be checked. Start Steam and run this again."
+				+ Ansi.Reset );
+			emit( "" );
+			ReportShimCache( emit );
+			return;
+		}
+
+		emit( Ansi.Green + "  steam launcher service up" + Ansi.Reset );
+
 		if ( !SniperRuntime.CheckRequirements( install, out var problems ) )
 		{
 			emit( Ansi.Red + "  this host cannot start a container:" + Ansi.Reset );
@@ -98,23 +123,27 @@ internal static class DependencyCheck
 		emit( Ansi.Green + "  requirements OK" + Ansi.Reset );
 
 		var cache = SniperCompat.CacheDirectory;
-		var sniperCommand = new List<string>
-		{
-			install.RunScript,
-			"--filesystem=" + cache,
-			"--",
-			"/bin/sh",
-			"-c",
-			SweepScript
-		};
+		env["SBOX_SNIPER_COMPAT"] = cache;
 
-		ReportSweep( sniperCommand, native, dotnet, cache, emit );
+		var sniperCommand = SteamLauncherService.Wrap(
+			install,
+			new List<string> { install.RunScript, "--filesystem=" + cache, "--" }.Concat( sweep ).ToList(),
+			repoRoot,
+			env );
+
+		ReportSweep( sniperCommand, env, emit );
 		emit( "" );
 		ReportShimCache( emit );
 	}
 
+	/// <summary>
+	/// Runs one sweep. The environment is set on the process here for the HOST
+	/// sweep; the container sweep gets the same dictionary a second time, as --env
+	/// arguments, because nothing crosses the launcher service by inheritance.
+	/// A container sweep reporting 0 binaries means that hand-over was missed.
+	/// </summary>
 	private static void ReportSweep(
-		IReadOnlyList<string> command, string native, string? dotnet, string compat, Action<string> emit )
+		IReadOnlyList<string> command, IReadOnlyDictionary<string, string> env, Action<string> emit )
 	{
 		var info = new ProcessStartInfo
 		{
@@ -127,9 +156,8 @@ internal static class DependencyCheck
 		for ( var i = 1; i < command.Count; i++ )
 			info.ArgumentList.Add( command[i] );
 
-		info.Environment["SBOX_NATIVE"] = native;
-		info.Environment["SBOX_DOTNET"] = dotnet ?? string.Empty;
-		info.Environment["SBOX_SNIPER_COMPAT"] = compat;
+		foreach ( var pair in env )
+			info.Environment[pair.Key] = pair.Value;
 
 		string output;
 

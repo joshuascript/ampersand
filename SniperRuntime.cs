@@ -21,6 +21,14 @@ internal sealed class SniperInstall
 
 	public string RequirementsCheck =>
 		System.IO.Path.Combine( Path, "pressure-vessel", "bin", "steam-runtime-check-requirements" );
+
+	/// <summary>
+	/// The client that hands a command to the launcher service running alongside
+	/// Steam. Everything ampersand runs in the container goes through this - see
+	/// <see cref="SteamLauncherService"/>.
+	/// </summary>
+	public string LaunchClient =>
+		System.IO.Path.Combine( Path, "pressure-vessel", "bin", "steam-runtime-launch-client" );
 }
 
 /// <summary>
@@ -142,9 +150,16 @@ internal static class SniperRuntime
 	}
 
 	/// <summary>
-	/// pressure-vessel needs bubblewrap and unprivileged user namespaces.
-	/// Distros disable those three different ways, so turn a failure into the
-	/// command that fixes it rather than an opaque error.
+	/// pressure-vessel needs bubblewrap and unprivileged user namespaces. Distros
+	/// disable those three different ways, so turn a failure into the command that
+	/// fixes it rather than an opaque error.
+	///
+	/// Run THROUGH the launcher service, because run directly it answers about the
+	/// wrong context and lies: it exits 0 on an Ubuntu host that cannot in fact
+	/// start a container, because pressure-vessel's fallback to /usr/bin/bwrap
+	/// works well enough for the probe while the real launch dies later on a
+	/// nested bwrap. Asked from inside Steam's profile it tests what a launch will
+	/// actually do.
 	/// </summary>
 	public static bool CheckRequirements( SniperInstall install, out List<string> problems )
 	{
@@ -157,18 +172,26 @@ internal static class SniperRuntime
 			return false;
 		}
 
+		var command = SteamLauncherService.Wrap(
+			install, new[] { checker }, string.Empty, new Dictionary<string, string>() );
+
+		var info = new ProcessStartInfo
+		{
+			FileName = command[0],
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+			UseShellExecute = false
+		};
+
+		for ( var i = 1; i < command.Count; i++ )
+			info.ArgumentList.Add( command[i] );
+
 		var output = string.Empty;
 		int exitCode;
 
 		try
 		{
-			using var process = Process.Start( new ProcessStartInfo
-			{
-				FileName = checker,
-				RedirectStandardOutput = true,
-				RedirectStandardError = true,
-				UseShellExecute = false
-			} );
+			using var process = Process.Start( info );
 
 			if ( process is null )
 			{
@@ -191,13 +214,6 @@ internal static class SniperRuntime
 
 		if ( output.Length > 0 )
 			problems.Add( output );
-
-		if ( ReadFlag( "/proc/sys/kernel/apparmor_restrict_unprivileged_userns" ) == 1
-			&& !File.Exists( "/etc/apparmor.d/bwrap-userns-restrict" ) )
-		{
-			problems.Add( "AppArmor is blocking unprivileged user namespaces and there is no bwrap profile. Install one, or:" );
-			problems.Add( "    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" );
-		}
 
 		if ( ReadFlag( "/proc/sys/kernel/unprivileged_userns_clone" ) == 0 )
 		{
