@@ -373,7 +373,35 @@ internal sealed class MainWindow : Window
 		updatingCheckbox = false;
 	}
 
+	/// <summary>
+	/// Guard around the launch path, and nothing else.
+	///
+	/// This is reached from a double-click handler, so it is async void: nothing
+	/// observes the task, and an exception escaping it is unhandled and takes the
+	/// window down. A tool for diagnosing a broken engine must not be killed by
+	/// the engine being broken, so a failure is reported into the target's own
+	/// pane instead. The prepare path is the live risk - it shells out, copies
+	/// megabytes, and waits on Steam.
+	/// </summary>
 	private async void Launch( LaunchTarget target )
+	{
+		try
+		{
+			await LaunchCore( target );
+		}
+		catch ( Exception e )
+		{
+			// Preparing is already cleared by LaunchCore's finally, whichever
+			// way it left.
+			//
+			// Message rather than the whole exception: the terminal is in raw
+			// mode and Append supplies one CRLF at the end, so the bare LFs in
+			// a stack trace would staircase it across the pane.
+			target.Append( "ampersand: launch failed - " + e.Message );
+		}
+	}
+
+	private async Task LaunchCore( LaunchTarget target )
 	{
 		var root = RepoRoot.Find();
 		if ( root is null )
@@ -572,7 +600,31 @@ internal sealed class MainWindow : Window
 		return true;
 	}
 
+	/// <summary>
+	/// Guard around the dependency check, for the same reason as Launch: an
+	/// async void click handler whose exception would otherwise be unhandled.
+	///
+	/// Unlike Launch this one has to undo something. The inner try already
+	/// covers the sweep, but not the statements ahead of it - and one of those
+	/// disables the button, so a throw there would leave the check permanently
+	/// greyed out with no way back short of a restart. Re-enabling here is what
+	/// makes this more than a log line.
+	/// </summary>
 	private async void RunDependencyCheck()
+	{
+		try
+		{
+			await RunDependencyCheckCore();
+		}
+		catch ( Exception e )
+		{
+			depCheckButton.IsEnabled = true;
+			statusText.Text = "dependency check failed";
+			FeedNotice( "ampersand: dependency check failed - " + e.Message );
+		}
+	}
+
+	private async Task RunDependencyCheckCore()
 	{
 		var root = RepoRoot.Find();
 
@@ -660,10 +712,15 @@ internal sealed class MainWindow : Window
 
 		// ">_" is the conventional shell glyph and, unlike an emoji, cannot
 		// fail to render on any font the system happens to have.
+		//
+		// The family has to be a real one. "monospace" is a fontconfig alias,
+		// not a family, so Avalonia does not resolve it and the glyph silently
+		// falls back to the proportional UI font - which is the one thing a
+		// shell prompt must not look like. Same family as the terminal itself.
 		row.Children.Add( new TextBlock
 		{
 			Text = ">_",
-			FontFamily = new FontFamily( "monospace" ),
+			FontFamily = new FontFamily( "DejaVu Sans Mono" ),
 			FontSize = 12,
 			Foreground = TerminalTheme.Launcher,
 			VerticalAlignment = VerticalAlignment.Center
