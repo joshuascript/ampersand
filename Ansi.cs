@@ -3,10 +3,11 @@ namespace Ampersand;
 /// <summary>
 /// SGR sequences for text the launcher writes into the terminal itself.
 ///
-/// The engine colours its own output, so these are only for our lines - the
-/// dependency report and status notices. Codes are the bright set, matching what
-/// the engine already uses, so our text sits in the same palette rather than
-/// looking like a second scheme layered on top.
+/// The only thing ampersand still prints as text is the dependency report, which
+/// runs in a real terminal (Program.DependencyCheckArgument), so these end up
+/// interpreted by the emulator rather than by anything in this app. Codes are the
+/// bright set, matching what the engine already uses, so the report sits in the
+/// same palette rather than looking like a second scheme layered on top.
 /// </summary>
 internal static class Ansi
 {
@@ -24,12 +25,4 @@ internal static class Ansi
 
 	/// <summary>Bright black, i.e. the dim grey terminals use for de-emphasis.</summary>
 	public const string Dim = Esc + "[90m";
-
-	/// <summary>Clears screen and scrollback, then homes the cursor.</summary>
-	public const string ClearAll = Esc + "[2J" + Esc + "[3J" + Esc + "[H";
-
-	public static string Paint( string colour, string text )
-	{
-		return colour + text + Reset;
-	}
 }

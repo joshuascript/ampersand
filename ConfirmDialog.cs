@@ -8,9 +8,9 @@ using Avalonia.Styling;
 namespace Ampersand;
 
 /// <summary>
-/// A yes/no prompt. Hand-built in the same style as the rest of the window - the
-/// app has no XAML and no dialog framework, and this is the only question it
-/// needs to ask.
+/// A yes/no prompt, and the one-button notice built from the same parts. Hand-built
+/// in the same style as the rest of the window - the app has no XAML and no dialog
+/// framework, and these are the only things it needs to say.
 /// </summary>
 internal static class ConfirmDialog
 {
@@ -20,6 +20,26 @@ internal static class ConfirmDialog
 	/// rather than a silent accept.
 	/// </summary>
 	public static Task<bool> Show( Window owner, string title, string message, string confirm, string cancel )
+	{
+		return Build( owner, title, message, confirm, cancel );
+	}
+
+	/// <summary>
+	/// A statement rather than a question: one button, and nothing to decide. Used
+	/// where ampersand cannot do anything about the condition itself - Steam not
+	/// running is the user's to fix, since starting the client for them was tried
+	/// and abandoned.
+	/// </summary>
+	public static Task Notify( Window owner, string title, string message, string dismiss = "OK" )
+	{
+		return Build( owner, title, message, dismiss, null );
+	}
+
+	/// <summary>
+	/// The shared body. A null <paramref name="cancel"/> drops the second button,
+	/// which is the only difference between the two shapes.
+	/// </summary>
+	private static Task<bool> Build( Window owner, string title, string message, string confirm, string? cancel )
 	{
 		var dialog = new Window
 		{
@@ -43,9 +63,6 @@ internal static class ConfirmDialog
 		var confirmButton = new Button { Content = confirm, IsDefault = true };
 		confirmButton.Click += ( _, _ ) => dialog.Close( true );
 
-		var cancelButton = new Button { Content = cancel, IsCancel = true };
-		cancelButton.Click += ( _, _ ) => dialog.Close( false );
-
 		var buttons = new StackPanel
 		{
 			Orientation = Orientation.Horizontal,
@@ -53,7 +70,17 @@ internal static class ConfirmDialog
 			HorizontalAlignment = HorizontalAlignment.Right,
 			Margin = new Thickness( 0, 16, 0, 0 )
 		};
-		buttons.Children.Add( cancelButton );
+
+		if ( cancel is not null )
+		{
+			// IsCancel only when there is something to cancel; on a notice Escape
+			// closes the window anyway, which yields the same default(bool).
+			var cancelButton = new Button { Content = cancel, IsCancel = true };
+			cancelButton.Click += ( _, _ ) => dialog.Close( false );
+
+			buttons.Children.Add( cancelButton );
+		}
+
 		buttons.Children.Add( confirmButton );
 
 		var body = new StackPanel { Margin = new Thickness( 16 ) };

@@ -1,8 +1,6 @@
-using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Threading;
 
 namespace Ampersand;
 
@@ -95,79 +93,6 @@ internal static class SteamLauncherService
 		wrapped.AddRange( command );
 
 		return wrapped;
-	}
-
-	/// <summary>
-	/// Starts the Steam client. /usr/games/steam and /usr/lib/steam/bin_steam.sh
-	/// are the paths the shipped `steam` AppArmor profile attaches to, so starting
-	/// through one of them is what puts the client - and therefore its launcher
-	/// service, and therefore us - inside the exemption.
-	/// </summary>
-	public static bool TryStartSteam( out string? problem )
-	{
-		problem = null;
-
-		var candidates = new (string File, string[] Args)[]
-		{
-			( "/usr/games/steam", new[] { "-silent" } ),
-			( "/usr/bin/steam", new[] { "-silent" } ),
-			( "steam", new[] { "-silent" } ),
-			( "flatpak", new[] { "run", "com.valvesoftware.Steam", "-silent" } )
-		};
-
-		foreach ( var candidate in candidates )
-		{
-			// A bare name is left for PATH resolution; an absolute path is only
-			// worth trying if it is there.
-			if ( candidate.File.StartsWith( '/' ) && !File.Exists( candidate.File ) )
-				continue;
-
-			var info = new ProcessStartInfo { FileName = candidate.File, UseShellExecute = false };
-
-			foreach ( var argument in candidate.Args )
-				info.ArgumentList.Add( argument );
-
-			try
-			{
-				if ( Process.Start( info ) is not null )
-					return true;
-			}
-			catch ( Exception e )
-			{
-				problem = e.Message;
-			}
-		}
-
-		problem = "could not start Steam" + ( problem is null ? "" : " - " + problem );
-		return false;
-	}
-
-	/// <summary>
-	/// Waits for the service to appear. Steam has to start, and may have to log
-	/// in, so the timeout is generous and progress is reported rather than the
-	/// caller staring at nothing.
-	/// </summary>
-	public static bool WaitForService( SniperInstall install, TimeSpan timeout, Action<string>? progress )
-	{
-		var deadline = DateTime.UtcNow + timeout;
-		var announced = false;
-
-		while ( true )
-		{
-			if ( IsAvailable( install ) )
-				return true;
-
-			if ( DateTime.UtcNow >= deadline )
-				return false;
-
-			if ( !announced )
-			{
-				progress?.Invoke( "waiting for Steam's launcher service..." );
-				announced = true;
-			}
-
-			Thread.Sleep( 2000 );
-		}
 	}
 
 	/// <summary>

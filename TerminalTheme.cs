@@ -3,29 +3,16 @@ using Avalonia.Media;
 namespace Ampersand;
 
 /// <summary>
-/// How much a line matters. Drives colour only - nothing is ever hidden.
-/// </summary>
-internal enum LineKind
-{
-	/// <summary>Indented continuation; takes the kind of the header above it.</summary>
-	Continuation,
-	Normal,
-	Muted,
-	Warning,
-	Error,
-	/// <summary>The launcher's own messages.</summary>
-	Launcher,
-	/// <summary>The echoed "$ command" line.</summary>
-	Command
-}
-
-/// <summary>
 /// A fixed dark palette for the whole window, in the manner of a code editor.
 ///
 /// Panels are told apart by BACKGROUND rather than by whitespace: they sit
 /// flush against each other, separated only by a 1px rule. The lightness runs
-/// as a depth gradient - the sidebar is the shallowest surface and the terminal
-/// the deepest, which is the convention in VS Code and the JetBrains IDEs.
+/// as a depth gradient - the sidebar is the shallowest surface and the target
+/// panel the deepest, which is the convention in VS Code and the JetBrains IDEs.
+///
+/// It was named for the terminal pane it was built around. The pane is gone and
+/// the name is kept only because every reference in the window uses it; what
+/// survives is the panel palette, which was never terminal-specific.
 /// </summary>
 internal static class TerminalTheme
 {
@@ -55,37 +42,12 @@ internal static class TerminalTheme
 	/// <summary>The advisory footer. Quieter still, but not invisible.</summary>
 	public static readonly IBrush FooterText = new SolidColorBrush( Color.FromRgb( 0x7A, 0x84, 0x9C ) );
 
-	/// <summary>Terminal output. The deepest surface.</summary>
+	/// <summary>The window behind everything. The deepest surface.</summary>
 	public static readonly IBrush Background = new SolidColorBrush( Color.FromRgb( 0x15, 0x17, 0x1F ) );
 
-	/// <summary>
-	/// Drag-selection in the output pane. Translucent, so the text underneath
-	/// stays readable and the highlight is obvious against the deepest surface.
-	/// An opaque fill this close to the pane's own colour is why selecting text
-	/// used to look like nothing had happened at all.
-	/// </summary>
-	public static readonly IBrush Selection = new SolidColorBrush( Color.FromArgb( 0x66, 0x4F, 0xC1, 0xFF ) );
-
+	/// <summary>Body text.</summary>
 	public static readonly IBrush Normal = new SolidColorBrush( Color.FromRgb( 0xD4, 0xD4, 0xD4 ) );
 
-	// The PreJit dumps are 92% of a startup. Pushing them back is the point.
-	public static readonly IBrush Muted = new SolidColorBrush( Color.FromRgb( 0x6B, 0x6F, 0x76 ) );
-
-	public static readonly IBrush Warning = new SolidColorBrush( Color.FromRgb( 0xD7, 0xA6, 0x5F ) );
-	public static readonly IBrush Error = new SolidColorBrush( Color.FromRgb( 0xF1, 0x4C, 0x4C ) );
+	/// <summary>The launcher's own accent, used for the sidebar glyph.</summary>
 	public static readonly IBrush Launcher = new SolidColorBrush( Color.FromRgb( 0x4F, 0xC1, 0xFF ) );
-	public static readonly IBrush Command = new SolidColorBrush( Color.FromRgb( 0x98, 0xC3, 0x79 ) );
-
-	public static IBrush BrushFor( LineKind kind )
-	{
-		return kind switch
-		{
-			LineKind.Error => Error,
-			LineKind.Warning => Warning,
-			LineKind.Muted => Muted,
-			LineKind.Launcher => Launcher,
-			LineKind.Command => Command,
-			_ => Normal
-		};
-	}
 }

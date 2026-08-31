@@ -16,7 +16,7 @@ internal sealed class SniperInstall
 		Path = path;
 		Version = version;
 	}
-
+	
 	public string RunScript => System.IO.Path.Combine( Path, "run-in-sniper" );
 
 	public string RequirementsCheck =>

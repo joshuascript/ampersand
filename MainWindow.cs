@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 using Avalonia;
@@ -12,37 +13,23 @@ using Avalonia.Data;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Styling;
-using Avalonia.Threading;
 using Avalonia.VisualTree;
-using AvaloniaTerminal;
 
 namespace Ampersand;
 
 internal sealed class MainWindow : Window
 {
-	// The grid a terminal is CONSTRUCTED with, before the control has been laid
-	// out and measured its own cell. It is transient - the first layout pass
-	// overwrites it (a 1040x660 window measures 107x16) - so nothing may be
-	// derived from it. The pty is opened at the terminal's live size instead;
-	// see Launch().
-	private const int Columns = 200;
-	private const int Rows = 50;
-
 	private readonly AvaloniaList<LaunchTarget> targets = new();
 
 	private readonly ListBox targetList;
-	private readonly Panel terminalHost;
-	private readonly TerminalControl diagnostics;
 	private readonly TextBlock statusText;
-	private readonly Button clearButton;
 	private readonly Button stopButton;
 	private readonly Button depCheckButton;
 	private readonly CheckBox steamRuntime;
-	private readonly CheckBox detachToggle;
+	private readonly CheckBox systemTerminal;
 
 	private LaunchTarget? selected;
 	private bool updatingCheckbox;
-	private bool showingDiagnostics;
 
 	public MainWindow()
 	{
@@ -52,10 +39,6 @@ internal sealed class MainWindow : Window
 		RequestedThemeVariant = ThemeVariant.Dark;
 		Background = TerminalTheme.Background;
 
-		diagnostics = CreateTerminal();
-		terminalHost = new Panel();
-		terminalHost.Children.Add( diagnostics );
-
 		foreach ( var (name, script) in new[]
 		{
 			( "sbox", "sbox.sh" ),
@@ -63,10 +46,7 @@ internal sealed class MainWindow : Window
 			( "sbox-server", "sbox-server.sh" )
 		} )
 		{
-			var terminal = CreateTerminal();
-			terminal.IsVisible = false;
-			terminalHost.Children.Add( terminal );
-			targets.Add( new LaunchTarget( name, script, terminal ) );
+			targets.Add( new LaunchTarget( name, script ) );
 		}
 
 		LoadMetadata();
@@ -75,6 +55,13 @@ internal sealed class MainWindow : Window
 		{
 			ItemsSource = targets,
 			Background = Brushes.Transparent,
+
+			// A LIST, not a grid of cells. Removing the output pane hands this
+			// panel the whole height, and the obvious move was to divide it
+			// between the targets - but a launch target is a row you pick, and
+			// blowing it up into a full-height button makes three scripts look
+			// like the three modes of the application. The rows stay their own
+			// size and the panel is simply taller.
 			ItemTemplate = new FuncDataTemplate<LaunchTarget>( ( _, _ ) =>
 			{
 				var text = new TextBlock { Margin = new Thickness( 6, 4 ) };
@@ -86,7 +73,7 @@ internal sealed class MainWindow : Window
 		// Single click SELECTS, double click LAUNCHES. They have to be separate
 		// gestures: the toggles are enabled per selection, so if one click did
 		// both there would be no moment in which you could set Steam Runtime or
-		// Detach for the run you are about to start.
+		// the terminal option for the run you are about to start.
 		targetList.SelectionChanged += ( _, _ ) => ShowSelected();
 		targetList.Tapped += ( _, e ) =>
 		{
@@ -117,70 +104,58 @@ internal sealed class MainWindow : Window
 				selected.UseSniper = steamRuntime.IsChecked == true;
 		};
 
-		// Detach is decided BEFORE launching: once the process owns a pty we
-		// cannot hand its stream to a terminal that starts later.
-		detachToggle = new CheckBox
+		// Decided BEFORE launching, because the emulator has to wrap the command
+		// at spawn time - there is nothing to attach to a window opened later.
+		systemTerminal = new CheckBox
 		{
-			Content = "Detach to system terminal",
+			Content = "Launch with system terminal",
 			IsEnabled = false,
 			VerticalAlignment = VerticalAlignment.Center
 		};
-		detachToggle.IsCheckedChanged += ( _, _ ) =>
+		systemTerminal.IsCheckedChanged += ( _, _ ) =>
 		{
 			if ( !updatingCheckbox && selected is not null )
-				selected.Detach = detachToggle.IsChecked == true;
+				selected.UseSystemTerminal = systemTerminal.IsChecked == true;
 		};
 
 		var toggles = new StackPanel
 		{
 			Orientation = Orientation.Horizontal,
 			Spacing = 16,
-			HorizontalAlignment = HorizontalAlignment.Right,
-			VerticalAlignment = VerticalAlignment.Center,
-			Margin = new Thickness( 12, 0 )
+			VerticalAlignment = VerticalAlignment.Center
 		};
-		toggles.Children.Add( detachToggle );
+		toggles.Children.Add( systemTerminal );
 		toggles.Children.Add( steamRuntime );
 
 		statusText = new TextBlock
 		{
-			Text = "idle",
+			Text = "double-click an app to launch it",
+			Foreground = TerminalTheme.Normal,
+			FontSize = 12,
 			VerticalAlignment = VerticalAlignment.Center,
-			Margin = new Thickness( 8, 0 )
+			Margin = new Thickness( 10, 0 ),
+			TextTrimming = TextTrimming.CharacterEllipsis
 		};
 
-		clearButton = new Button { Content = "Clear", Margin = new Thickness( 4, 4 ) };
-		clearButton.Click += ( _, _ ) => ClearCurrentBuffer();
-
-		stopButton = new Button { Content = "Stop", IsEnabled = false, Margin = new Thickness( 4, 4, 8, 4 ) };
+		stopButton = new Button { Content = "Stop", IsEnabled = false, Margin = new Thickness( 8, 6, 10, 6 ) };
 		stopButton.Click += ( _, _ ) => selected?.Runner.Stop();
 
-		var outputHeader = new Grid
-		{
-			ColumnDefinitions = new ColumnDefinitions( "*,Auto,Auto" ),
-			Background = TerminalTheme.ToolbarPanel
-		};
-		outputHeader.Children.Add( statusText );
-		Grid.SetColumn( clearButton, 1 );
-		outputHeader.Children.Add( clearButton );
+		// One bar, not the old header-plus-strip: with no pane between them there
+		// is nothing for two separate surfaces to separate.
+		var bar = new Grid { ColumnDefinitions = new ColumnDefinitions( "*,Auto,Auto" ) };
+		bar.Children.Add( statusText );
+		Grid.SetColumn( toggles, 1 );
+		bar.Children.Add( toggles );
 		Grid.SetColumn( stopButton, 2 );
-		outputHeader.Children.Add( stopButton );
+		bar.Children.Add( stopButton );
 
-		var bottom = new Grid { RowDefinitions = new RowDefinitions( "Auto,*" ) };
-		bottom.Children.Add( outputHeader );
-		Grid.SetRow( terminalHost, 1 );
-		bottom.Children.Add( terminalHost );
+		var right = new Grid { RowDefinitions = new RowDefinitions( "*,Auto" ) };
+		var targetPanel = Surface( targetList, TerminalTheme.TargetPanel, new Thickness( 0, 0, 0, 1 ) );
+		var barPanel = Surface( bar, TerminalTheme.ToolbarPanel, new Thickness( 0 ) );
 
-		var right = new Grid { RowDefinitions = new RowDefinitions( "50*,8*,42*" ) };
-		var topPanel = Surface( targetList, TerminalTheme.TargetPanel, new Thickness( 0, 0, 0, 1 ) );
-		var midPanel = Surface( toggles, TerminalTheme.ToolbarPanel, new Thickness( 0, 0, 0, 1 ) );
-		var bottomPanel = Surface( bottom, TerminalTheme.Background, new Thickness( 0 ) );
-
-		right.Children.Add( topPanel );
-		Grid.SetRow( midPanel, 1 );
-		right.Children.Add( midPanel );
-		Grid.SetRow( bottomPanel, 2 );
-		right.Children.Add( bottomPanel );
+		right.Children.Add( targetPanel );
+		Grid.SetRow( barPanel, 1 );
+		right.Children.Add( barPanel );
 
 		depCheckButton = SidebarButton( "Check for missing dependencies" );
 		depCheckButton.Click += ( _, _ ) => RunDependencyCheck();
@@ -213,6 +188,7 @@ internal sealed class MainWindow : Window
 		foreach ( var target in targets )
 		{
 			var captured = target;
+
 			captured.Runner.StateChanged += _ =>
 			{
 				captured.NotifyStatusChanged();
@@ -220,104 +196,20 @@ internal sealed class MainWindow : Window
 				if ( ReferenceEquals( captured, selected ) )
 					UpdateStatusBar();
 			};
-		}
 
-		showingDiagnostics = true;
-		FeedNotice( "ampersand: select an app above, set any options, then double-click to launch." );
+			// The runner's own lines used to be written into that target's pane.
+			// There is no pane, so they land on the status bar - and only while
+			// that target is the selected one, since the bar describes the
+			// selection and a background target overwriting it would be a lie.
+			captured.Runner.Notice += line =>
+			{
+				if ( ReferenceEquals( captured, selected ) )
+					statusText.Text = captured.Name + ": " + line;
+			};
+		}
 
 		if ( SystemTerminal.Detect() is null )
-			FeedNotice( "ampersand: no terminal emulator found - Detach will stay unavailable." );
-	}
-
-	/// <summary>
-	/// A terminal for one target. AvaloniaTerminal is an xterm.js port, so it
-	/// brings its own scrollback, follow-the-tail behaviour, selection and search
-	/// - all of which we previously hand-rolled.
-	/// </summary>
-	private TerminalControl CreateTerminal()
-	{
-		// THE control does not create its own model - the host must. Without
-		// this assignment Model stays null forever and every Feed is silently
-		// discarded, which is exactly what produced a blank pane.
-		//
-		// Cols and Rows are the construction size only - the control measures
-		// its own cell and resizes the grid on the first layout pass.
-		//
-		// There is deliberately no ReflowOnResize here. The library exposes it
-		// and it reads like the flag that governs this, but it is inert: it is
-		// never forwarded to the engine, and XTerm.NET 1.0.12 has no reflow to
-		// forward it to. Setting it taught us nothing and cost a diagnosis.
-		var model = new TerminalControlModel( new TerminalOptions
-		{
-			Cols = Columns,
-			Rows = Rows,
-			Scrollback = 10000
-		} );
-
-		var terminal = new TerminalControl
-		{
-			Model = model,
-			FontFamily = "DejaVu Sans Mono",
-			FontSize = 12,
-			Background = TerminalTheme.Background,
-			SelectionBrush = TerminalTheme.Selection
-		};
-
-		var copy = new MenuItem { Header = "Copy" };
-		copy.Click += async ( _, _ ) => await terminal.CopySelectionAsync();
-
-		// CopySelectionAsync is a silent no-op with nothing selected, so the
-		// item has to say so rather than looking like it did nothing.
-		copy.Bind( IsEnabledProperty, terminal.GetObservable( TerminalControl.HasSelectionProperty ) );
-
-		var paste = new MenuItem { Header = "Paste" };
-		paste.Click += async ( _, _ ) => await terminal.PasteFromClipboardAsync();
-
-		var selectAll = new MenuItem { Header = "Select All" };
-		selectAll.Click += ( _, _ ) => terminal.SelectAll();
-
-		var clear = new MenuItem { Header = "Clear" };
-		clear.Click += ( _, _ ) => ClearCurrentBuffer();
-
-		var menu = new ContextMenu();
-		menu.Items.Add( copy );
-		menu.Items.Add( paste );
-		menu.Items.Add( selectAll );
-		menu.Items.Add( new Separator() );
-		menu.Items.Add( clear );
-		terminal.ContextMenu = menu;
-
-		TerminalClipboard.Attach( terminal );
-
-		return terminal;
-	}
-
-	private void ShowTerminal( TerminalControl terminal )
-	{
-		foreach ( var child in terminalHost.Children )
-			child.IsVisible = ReferenceEquals( child, terminal );
-	}
-
-	private void FeedDiagnostic( string line )
-	{
-		diagnostics.Model.Feed( line + "\r\n" );
-	}
-
-	/// <summary>One of the launcher's own messages, in the accent colour.</summary>
-	private void FeedNotice( string line )
-	{
-		FeedDiagnostic( Ansi.Paint( Ansi.Cyan, line ) );
-	}
-
-	private void ClearCurrentBuffer()
-	{
-		if ( showingDiagnostics )
-		{
-			diagnostics.Model.Feed( Ansi.ClearAll );
-			return;
-		}
-
-		selected?.Clear();
+			statusText.Text = "no terminal emulator found - launches will run with their output discarded";
 	}
 
 	/// <summary>True when a pointer event landed on a row rather than the empty
@@ -332,14 +224,11 @@ internal sealed class MainWindow : Window
 		if ( targetList.SelectedItem is not LaunchTarget target )
 			return;
 
-		if ( ReferenceEquals( target, selected ) && !showingDiagnostics )
+		if ( ReferenceEquals( target, selected ) )
 			return;
 
-		showingDiagnostics = false;
 		selected = target;
-		ShowTerminal( target.Terminal );
 		UpdateStatusBar();
-		UpdateToggles( target );
 	}
 
 	private void UpdateToggles( LaunchTarget target )
@@ -364,10 +253,10 @@ internal sealed class MainWindow : Window
 				break;
 		}
 
-		// Detach cannot be changed once running, because the stream is already
-		// committed to either the pty or the emulator.
-		detachToggle.IsChecked = target.Detach;
-		detachToggle.IsEnabled = SystemTerminal.Detect() is not null
+		// Cannot be changed once running: the choice is baked into the command
+		// that was already spawned.
+		systemTerminal.IsChecked = target.UseSystemTerminal;
+		systemTerminal.IsEnabled = SystemTerminal.Detect() is not null
 			&& !target.Runner.IsRunning && !target.Preparing;
 
 		updatingCheckbox = false;
@@ -379,9 +268,8 @@ internal sealed class MainWindow : Window
 	/// This is reached from a double-click handler, so it is async void: nothing
 	/// observes the task, and an exception escaping it is unhandled and takes the
 	/// window down. A tool for diagnosing a broken engine must not be killed by
-	/// the engine being broken, so a failure is reported into the target's own
-	/// pane instead. The prepare path is the live risk - it shells out, copies
-	/// megabytes, and waits on Steam.
+	/// the engine being broken. The prepare path is the live risk - it shells
+	/// out, copies megabytes, and waits on Steam.
 	/// </summary>
 	private async void Launch( LaunchTarget target )
 	{
@@ -393,11 +281,7 @@ internal sealed class MainWindow : Window
 		{
 			// Preparing is already cleared by LaunchCore's finally, whichever
 			// way it left.
-			//
-			// Message rather than the whole exception: the terminal is in raw
-			// mode and Append supplies one CRLF at the end, so the bare LFs in
-			// a stack trace would staircase it across the pane.
-			target.Append( "ampersand: launch failed - " + e.Message );
+			await Fail( target, "Launch failed", e.Message );
 		}
 	}
 
@@ -406,18 +290,18 @@ internal sealed class MainWindow : Window
 		var root = RepoRoot.Find();
 		if ( root is null )
 		{
-			target.Append( "ampersand: could not locate the repo root - expected game/ and engine/ above this binary" );
+			await Fail( target, "Repo root not found",
+				"ampersand could not locate the s&box tree - it expects game/ and engine/ "
+					+ "somewhere above this binary." );
 			return;
 		}
 
 		var script = Path.Combine( root, "ampersand", "apps", target.ScriptFile );
 		if ( !File.Exists( script ) )
 		{
-			target.Append( "ampersand: launch script not found: " + script );
+			await Fail( target, "Launch script missing", "Not found:\n\n" + script );
 			return;
 		}
-
-		target.Clear();
 
 		var env = new Dictionary<string, string> { ["SBOX_REPO_ROOT"] = root };
 		var command = new List<string>();
@@ -425,6 +309,8 @@ internal sealed class MainWindow : Window
 		// Held across the await below, not just the spawn: PrepareSniper can sit
 		// for minutes waiting on Steam, and nothing else marks the target busy.
 		target.Preparing = true;
+		target.NotifyStatusChanged();
+		UpdateStatusBar();
 
 		try
 		{
@@ -443,26 +329,18 @@ internal sealed class MainWindow : Window
 			target.Preparing = false;
 		}
 
-		target.Append( "$ " + string.Join( " ", command ) );
-
 		try
 		{
-			// The pane has already been laid out and measured, so this is the
-			// grid on screen. Opening the pty at the constant instead would
-			// have the engine format for 200 columns inside a 107-column
-			// window, and nothing would tell it otherwise until a resize.
-			var grid = target.Grid;
-			target.Runner.Start( command, root, env, target.Detach, grid.Cols, grid.Rows );
+			target.Runner.Start( command, root, env, target.UseSystemTerminal );
 		}
 		catch ( Exception e )
 		{
-			target.Append( "ampersand: failed to start - " + e.Message );
+			await Fail( target, "Launch failed", e.Message );
 			return;
 		}
 
 		target.NotifyStatusChanged();
 		UpdateStatusBar();
-		UpdateToggles( target );
 	}
 
 	/// <summary>
@@ -485,20 +363,24 @@ internal sealed class MainWindow : Window
 
 		if ( install is null )
 		{
-			target.Append( "ampersand: Steam Linux Runtime 3.0 (sniper) is not installed." );
-			target.Append( "    Install it from Steam:  steam steam://install/" + SniperRuntime.SteamAppId );
+			await Fail( target, "Steam Linux Runtime not installed",
+				"Steam Linux Runtime 3.0 (sniper) is not installed.\n\n"
+					+ "Install it from Steam:  steam steam://install/" + SniperRuntime.SteamAppId );
 			return false;
 		}
 
-		target.Append( "ampersand: runtime " + install.Path + " (" + install.Version + ")" );
+		statusText.Text = target.Name + ": runtime " + install.Version;
 
 		// Everything below shells out or copies megabytes, so none of it may run
 		// on the UI thread - the probe alone can sit five seconds. This is the
 		// reason the method is async; awaiting a blocking call would only move
 		// the freeze, not remove it.
-		if ( !await Task.Run( () => SteamLauncherService.IsAvailable( install ) )
-			&& !await StartSteamFor( target, install ) )
+		if ( !await Task.Run( () => SteamLauncherService.IsAvailable( install ) ) )
 		{
+			await Fail( target, "Steam is not running",
+				"s&box can only be launched in the Steam runtime while the Steam client is "
+					+ "running - the container is entered through Steam's own launcher service.\n\n"
+					+ "Start Steam, wait for it to sign in, then try again." );
 			return false;
 		}
 
@@ -510,11 +392,9 @@ internal sealed class MainWindow : Window
 
 		if ( !requirements.Met )
 		{
-			target.Append( "ampersand: this host cannot start a pressure-vessel container." );
-
-			foreach ( var problem in requirements.Problems )
-				target.Append( "    " + problem );
-
+			await Fail( target, "Container cannot start",
+				"This host cannot start a pressure-vessel container.\n\n"
+					+ string.Join( "\n", requirements.Problems ) );
 			return false;
 		}
 
@@ -526,9 +406,7 @@ internal sealed class MainWindow : Window
 
 		if ( !compat.Ready )
 		{
-			foreach ( var problem in compat.Problems )
-				target.Append( "ampersand: " + problem );
-
+			await Fail( target, "Compat libraries unavailable", string.Join( "\n", compat.Problems ) );
 			return false;
 		}
 
@@ -537,8 +415,10 @@ internal sealed class MainWindow : Window
 		env["SBOX_IN_SNIPER"] = "1";
 		env["SBOX_SNIPER_COMPAT"] = cache;
 
-		// TERM is added here rather than left to ProcessRunner: that one is set on
-		// launch-client's own environment, and the child does not inherit it.
+		// TERM is added here rather than left to the emulator: this one is set on
+		// launch-client's own environment, and the child does not inherit it. It
+		// is handed over unconditionally - in background mode there is no tty, so
+		// the engine suppresses colour regardless of what TERM says.
 		var passed = new Dictionary<string, string>( env ) { ["TERM"] = ProcessRunner.Term };
 
 		command.AddRange( SteamLauncherService.Wrap(
@@ -551,112 +431,82 @@ internal sealed class MainWindow : Window
 	}
 
 	/// <summary>
-	/// Offers to start Steam, then waits for its launcher service. Declining, or a
-	/// Steam that never comes up, aborts the launch - there is no second route
-	/// into the container to fall back to.
+	/// How a launch failure is reported now that there is no pane to print it
+	/// into: the status bar keeps the short form, and a dialog carries the part
+	/// that needs more than one line. Both, because the bar is a glance and the
+	/// dialog is the explanation.
 	/// </summary>
-	private async Task<bool> StartSteamFor( LaunchTarget target, SniperInstall install )
+	private async Task Fail( LaunchTarget target, string title, string message )
 	{
-		target.Append( "ampersand: Steam is not running." );
-		target.Append( "    The Steam runtime can only be entered under Steam's own AppArmor profile," );
-		target.Append( "    so the client has to be up. See docs/sniper-userns-apparmor.md." );
+		statusText.Text = target.Name + ": " + title.ToLowerInvariant();
+		UpdateStatusBar();
 
-		var start = await ConfirmDialog.Show(
-			this,
-			"Steam is not running",
-			"s&box can only be launched in the Steam runtime while the Steam client is "
-				+ "running - the container is entered through Steam's own launcher service.\n\n"
-				+ "Start Steam now and wait for it?",
-			"Start Steam",
-			"Cancel" );
-
-		if ( !start )
-		{
-			target.Append( "ampersand: launch cancelled." );
-			return false;
-		}
-
-		if ( !SteamLauncherService.TryStartSteam( out var problem ) )
-		{
-			target.Append( "ampersand: " + problem );
-			return false;
-		}
-
-		target.Append( "ampersand: starting Steam..." );
-
-		var ready = await Task.Run( () => SteamLauncherService.WaitForService(
-			install,
-			TimeSpan.FromMinutes( 2 ),
-			line => Dispatcher.UIThread.Post( () => target.Append( "ampersand: " + line ) ) ) );
-
-		if ( !ready )
-		{
-			target.Append( "ampersand: Steam's launcher service did not appear - launch cancelled." );
-			target.Append( "    Check Steam is signed in, then try again." );
-			return false;
-		}
-
-		target.Append( "ampersand: Steam is up." );
-		return true;
+		await ConfirmDialog.Notify( this, title, message );
 	}
 
 	/// <summary>
-	/// Guard around the dependency check, for the same reason as Launch: an
-	/// async void click handler whose exception would otherwise be unhandled.
+	/// Runs the dependency sweep in the user's terminal emulator, by re-execing
+	/// this binary with --dependency-check (see Program).
 	///
-	/// Unlike Launch this one has to undo something. The inner try already
-	/// covers the sweep, but not the statements ahead of it - and one of those
-	/// disables the button, so a throw there would leave the check permanently
-	/// greyed out with no way back short of a restart. Re-enabling here is what
-	/// makes this more than a log line.
+	/// The sweep used to print into the diagnostics pane. Re-execing rather than
+	/// running it in-process and piping the text somewhere is what keeps the
+	/// report intact: it is coloured with SGR sequences and aligned in columns,
+	/// both of which need a real terminal - and this way the app keeps no output
+	/// surface of its own at all.
 	/// </summary>
 	private async void RunDependencyCheck()
 	{
 		try
 		{
-			await RunDependencyCheckCore();
+			var root = RepoRoot.Find();
+			if ( root is null )
+			{
+				await ConfirmDialog.Notify( this, "Repo root not found",
+					"ampersand could not locate the s&box tree - it expects game/ and engine/ "
+						+ "somewhere above this binary." );
+				return;
+			}
+
+			// Null only for a single-file host that cannot report its own path;
+			// Assembly.Location is empty in that case too, so there is nothing
+			// better to fall back to.
+			var self = Environment.ProcessPath;
+			if ( self is null )
+			{
+				await ConfirmDialog.Notify( this, "Cannot re-exec",
+					"ampersand could not determine its own path, so it cannot run the "
+						+ "dependency check in a terminal." );
+				return;
+			}
+
+			if ( !SystemTerminal.TryBuild( new[] { self, Program.DependencyCheckArgument },
+					out var argv, out var emulator ) )
+			{
+				await ConfirmDialog.Notify( this, "No terminal emulator",
+					"The dependency check prints a coloured report, so it needs a terminal "
+						+ "window - and no emulator was found on PATH.\n\n"
+						+ "Install one (gnome-terminal, konsole, alacritty, kitty, foot, xterm...), "
+						+ "or run it yourself:\n\n"
+						+ self + " " + Program.DependencyCheckArgument );
+				return;
+			}
+
+			var info = new ProcessStartInfo
+			{
+				FileName = argv[0],
+				WorkingDirectory = root,
+				UseShellExecute = false
+			};
+
+			for ( var i = 1; i < argv.Count; i++ )
+				info.ArgumentList.Add( argv[i] );
+
+			Process.Start( info );
+			statusText.Text = "dependency check running in " + emulator;
 		}
 		catch ( Exception e )
 		{
-			depCheckButton.IsEnabled = true;
-			statusText.Text = "dependency check failed";
-			FeedNotice( "ampersand: dependency check failed - " + e.Message );
-		}
-	}
-
-	private async Task RunDependencyCheckCore()
-	{
-		var root = RepoRoot.Find();
-
-		showingDiagnostics = true;
-		ShowTerminal( diagnostics );
-		diagnostics.Model.Feed( Ansi.ClearAll );
-
-		if ( root is null )
-		{
-			FeedNotice( "ampersand: could not locate the repo root" );
-			return;
-		}
-
-		depCheckButton.IsEnabled = false;
-		stopButton.IsEnabled = false;
-		statusText.Text = "checking dependencies...";
-
-		try
-		{
-			await Task.Run( () => DependencyCheck.Run( root,
-				line => Dispatcher.UIThread.Post( () => FeedDiagnostic( line ) ) ) );
-
-			statusText.Text = "dependency check complete";
-		}
-		catch ( Exception e )
-		{
-			FeedNotice( "ampersand: dependency check failed - " + e.Message );
-			statusText.Text = "dependency check failed";
-		}
-		finally
-		{
-			depCheckButton.IsEnabled = true;
+			statusText.Text = "dependency check failed - " + e.Message;
 		}
 	}
 
@@ -665,15 +515,17 @@ internal sealed class MainWindow : Window
 		if ( selected is null )
 		{
 			stopButton.IsEnabled = false;
-			statusText.Text = "idle";
 			return;
 		}
 
 		var runner = selected.Runner;
 		stopButton.IsEnabled = runner.IsRunning;
 
-		if ( runner.IsRunning )
-			statusText.Text = ( selected.Detach ? "detached - " : "running - " ) + runner.Name;
+		if ( selected.Preparing )
+			statusText.Text = "preparing - " + runner.Name;
+		else if ( runner.IsRunning )
+			statusText.Text = ( selected.UseSystemTerminal ? "running in a terminal - " : "running - " )
+				+ runner.Name;
 		else if ( runner.ExitCode is int code )
 			statusText.Text = "exited " + code + " - " + runner.Name;
 		else
@@ -716,7 +568,7 @@ internal sealed class MainWindow : Window
 		// The family has to be a real one. "monospace" is a fontconfig alias,
 		// not a family, so Avalonia does not resolve it and the glyph silently
 		// falls back to the proportional UI font - which is the one thing a
-		// shell prompt must not look like. Same family as the terminal itself.
+		// shell prompt must not look like.
 		row.Children.Add( new TextBlock
 		{
 			Text = ">_",
@@ -783,7 +635,7 @@ internal sealed class MainWindow : Window
 
 	/// <summary>
 	/// Standing advisory. The left panel runs arbitrary executables dropped into
-	/// a scanned folder (§4b), including ones shared by other people, so the
+	/// a scanned folder (spec 4b), including ones shared by other people, so the
 	/// warning is permanent rather than a dismissible prompt.
 	/// </summary>
 	private static Border SidebarFooter( string text )
@@ -796,7 +648,7 @@ internal sealed class MainWindow : Window
 
 		row.Children.Add( new TextBlock
 		{
-			Text = "\u24d8",
+			Text = "ⓘ",
 			FontSize = 13,
 			Foreground = TerminalTheme.FooterText,
 			VerticalAlignment = VerticalAlignment.Center
