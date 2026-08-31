@@ -264,16 +264,43 @@ internal static class DependencyCheck
 		emit( "\"HRESULT: 0x80008088\" or a TypeInitializationException in Interop.Crypto." + Ansi.Reset );
 	}
 
+	/// <summary>
+	/// The engine's own copy of the shared framework, which is not the host's. The launchers are
+	/// built with -p:AppHostRelativeDotNet=bin/dotnet (BuildManaged.cs), so this is the runtime a
+	/// real launch resolves against; a system install under /usr/lib/dotnet is not even visible
+	/// inside the sniper container, which brings its own /usr.
+	///
+	/// It moved to game/bin/dotnet in sbox-public 9eba55b6 ("game/dotnet -> game/bin/dotnet").
+	/// The old top-level path is still probed second, so a tree built before that move keeps
+	/// reporting instead of claiming the runtime is absent.
+	///
+	/// Pointing this at the wrong directory fails quietly as well as loudly: SBOX_DOTNET goes
+	/// over as an empty string, the sweep's `[ -d "$dir" ] || continue` drops the runtime half,
+	/// and the summary comes back clean - while it is precisely the .NET runtime's libunwind and
+	/// OpenSSL 3 that are missing inside the container.
+	/// </summary>
 	private static string? FindDotnetRuntime( string repoRoot )
 	{
-		var shared = Path.Combine( repoRoot, "game", "dotnet", "shared", "Microsoft.NETCore.App" );
+		string[] candidates =
+		[
+			Path.Combine( repoRoot, "game", "bin", "dotnet" ),
+			Path.Combine( repoRoot, "game", "dotnet" )
+		];
 
-		if ( !Directory.Exists( shared ) )
-			return null;
+		foreach ( var candidate in candidates )
+		{
+			var shared = Path.Combine( candidate, "shared", "Microsoft.NETCore.App" );
 
-		var versions = Directory.GetDirectories( shared );
-		Array.Sort( versions, StringComparer.Ordinal );
+			if ( !Directory.Exists( shared ) )
+				continue;
 
-		return versions.Length > 0 ? versions[^1] : null;
+			var versions = Directory.GetDirectories( shared );
+			Array.Sort( versions, StringComparer.Ordinal );
+
+			if ( versions.Length > 0 )
+				return versions[^1];
+		}
+
+		return null;
 	}
 }
