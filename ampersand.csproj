@@ -13,8 +13,6 @@
 		<PackageReference Include="Avalonia" Version="12.*" />
 		<PackageReference Include="Avalonia.Desktop" Version="12.*" />
 		<PackageReference Include="Avalonia.Themes.Fluent" Version="12.*" />
-		<PackageReference Include="AvaloniaTerminal" Version="*" />
-		<PackageReference Include="Porta.Pty" Version="*" />
 	</ItemGroup>
 
 	<ItemGroup>
