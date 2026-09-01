@@ -463,10 +463,22 @@ internal sealed class MainWindow : Window
 			}
 		}
 
-		var script = Path.Combine( root, "ampersand", "apps", target.ScriptFile );
-		if ( !File.Exists( script ) )
+		// Scripts live with the built app (OutDir/scripts/), not inside the
+		// sbox checkout. They stay loose files so users can edit them at runtime.
+		var script = AppPaths.FindScript( target.ScriptFile );
+		if ( script is null )
 		{
-			await Fail( target, "Launch script missing", "Not found:\n\n" + script );
+			// Legacy fallback: ampersand inside sbox checkout (dev layout)
+			var legacy = Path.Combine( root, "ampersand", "apps", target.ScriptFile );
+			if ( File.Exists( legacy ) )
+				script = legacy;
+		}
+		if ( script is null || !File.Exists( script ) )
+		{
+			var tried = AppPaths.FindScriptsDir() ?? AppPaths.ScriptsDir;
+			await Fail( target, "Launch script missing",
+				$"Not found: {target.ScriptFile}\n\nLooked in:\n{tried}\n(built scripts dir)\n\n"
+				+ "Rebuild ampersand or check that apps/*.sh were copied to <OutDir>/scripts/." );
 			return;
 		}
 
@@ -743,13 +755,27 @@ internal sealed class MainWindow : Window
 
 	private void LoadMetadata()
 	{
-		var root = GetSboxRoot() ?? SboxSettings.GetStalePersistedPath() ?? RepoRoot.Find();
-		if ( root is null || !RepoRoot.IsValidRoot( root ) )
+		// Metadata comes from the built scripts (AppContext.BaseDirectory/scripts/),
+		// not from the sbox checkout. Scripts are loose files so they can be
+		// edited at runtime.
+		var scriptsDir = AppPaths.FindScriptsDir();
+		if ( scriptsDir is null )
+		{
+			// Legacy dev fallback: sboxRoot/ampersand/apps
+			var root = GetSboxRoot() ?? SboxSettings.GetStalePersistedPath() ?? RepoRoot.Find();
+			if ( root is not null && RepoRoot.IsValidRoot( root ) )
+			{
+				var legacyDir = Path.Combine( root, "ampersand", "apps" );
+				if ( Directory.Exists( legacyDir ) )
+					scriptsDir = legacyDir;
+			}
+		}
+		if ( scriptsDir is null )
 			return;
 
 		foreach ( var target in targets )
 		{
-			var script = Path.Combine( root, "ampersand", "apps", target.ScriptFile );
+			var script = Path.Combine( scriptsDir, target.ScriptFile );
 
 			if ( !File.Exists( script ) )
 				continue;
