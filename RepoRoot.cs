@@ -5,6 +5,17 @@ namespace Ampersand;
 
 internal static class RepoRoot
 {
+	public static bool IsValidRoot( string? path )
+	{
+		if ( string.IsNullOrWhiteSpace( path ) ) return false;
+		try
+		{
+			return Directory.Exists( Path.Combine( path, "game" ) )
+				&& Directory.Exists( Path.Combine( path, "engine" ) );
+		}
+		catch { return false; }
+	}
+
 	/// <summary>
 	/// The published launcher sits at the repo root, but during development it
 	/// runs from ampersand/bin/..., so walk up until the tree looks right.

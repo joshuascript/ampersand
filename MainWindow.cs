@@ -7,9 +7,9 @@ using Avalonia;
 using Avalonia.Collections;
 using Avalonia.Controls;
 using Avalonia.Controls.Presenters;
-using Avalonia.Controls.Primitives;
 using Avalonia.Controls.Templates;
 using Avalonia.Data;
+using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Styling;
@@ -26,11 +26,15 @@ internal sealed class MainWindow : Window
 	private readonly Button stopButton;
 	private readonly Button depCheckButton;
 	private readonly Button logFolderButton;
+	private readonly Button replacePathButton;
+	private readonly TextBlock sboxPathText;
 	private readonly CheckBox steamRuntime;
 	private readonly CheckBox systemTerminal;
 
 	private LaunchTarget? selected;
 	private bool updatingCheckbox;
+	private string? resolvedRoot;
+	private bool sboxRootPromptShown;
 
 	public MainWindow()
 	{
@@ -57,40 +61,107 @@ internal sealed class MainWindow : Window
 			ItemsSource = targets,
 			Background = Brushes.Transparent,
 
-			// A LIST, not a grid of cells. Removing the output pane hands this
-			// panel the whole height, and the obvious move was to divide it
-			// between the targets - but a launch target is a row you pick, and
-			// blowing it up into a full-height button makes three scripts look
-			// like the three modes of the application. The rows stay their own
-			// size and the panel is simply taller.
-			ItemTemplate = new FuncDataTemplate<LaunchTarget>( ( _, _ ) =>
+			// Each shell script row gets an explicit play button instead of the
+			// old invisible double-click/text affordance. Row is a grid: label
+			// left, ▶ right. Double-click still works for muscle memory.
+			ItemTemplate = new FuncDataTemplate<LaunchTarget>( ( item, _ ) =>
 			{
-				var text = new TextBlock { Margin = new Thickness( 6, 4 ) };
+				if ( item is not LaunchTarget target )
+					return new TextBlock { Text = "" };
+
+				var grid = new Grid
+				{
+					ColumnDefinitions = new ColumnDefinitions( "*,Auto" ),
+					Background = Brushes.Transparent
+				};
+
+				var text = new TextBlock
+				{
+					Margin = new Thickness( 6, 4 ),
+					VerticalAlignment = VerticalAlignment.Center
+				};
 				text.Bind( TextBlock.TextProperty, new Binding( nameof( LaunchTarget.Display ) ) );
-				return text;
+				grid.Children.Add( text );
+
+				var glyph = new TextBlock
+				{
+					Text = "▶",
+					FontSize = 13,
+					FontFamily = new FontFamily( "DejaVu Sans Mono" ),
+					Foreground = TerminalTheme.Launcher,
+					VerticalAlignment = VerticalAlignment.Center,
+					HorizontalAlignment = HorizontalAlignment.Center
+				};
+
+				var playButton = new Button
+				{
+					Content = glyph,
+					Width = 32,
+					Height = 28,
+					Padding = new Thickness( 0 ),
+					Margin = new Thickness( 4, 2, 4, 2 ),
+					CornerRadius = new CornerRadius( 4 ),
+					Background = Brushes.Transparent,
+					BorderThickness = new Thickness( 0 ),
+					HorizontalContentAlignment = HorizontalAlignment.Center,
+					VerticalContentAlignment = VerticalAlignment.Center,
+					Cursor = new Cursor( StandardCursorType.Hand )
+				};
+
+				playButton.Styles.Add( PresenterFill( ":pointerover", TerminalTheme.SidebarHover ) );
+				playButton.Styles.Add( PresenterFill( ":pressed", TerminalTheme.SidebarPressed ) );
+
+				void UpdateState()
+				{
+					var busy = target.Runner.IsRunning || target.Preparing;
+					playButton.IsEnabled = !busy;
+					glyph.Opacity = busy ? 0.35 : 1.0;
+					ToolTip.SetTip( playButton, busy ? "Already running" : $"Launch {target.Name}" );
+				}
+
+				playButton.Click += ( _, e ) =>
+				{
+					e.Handled = true;
+					if ( target.Runner.IsRunning || target.Preparing )
+						return;
+					targetList.SelectedItem = target;
+					ShowSelected();
+					Launch( target );
+				};
+
+				// Keep button state in sync. Capture handlers for later detach.
+				System.Action<ProcessRunner> runnerHandler = _ => Avalonia.Threading.Dispatcher.UIThread.Post( UpdateState );
+				System.ComponentModel.PropertyChangedEventHandler displayHandler = ( _, e ) =>
+				{
+					if ( e.PropertyName == nameof( LaunchTarget.Display ) )
+						Avalonia.Threading.Dispatcher.UIThread.Post( UpdateState );
+				};
+
+				target.Runner.StateChanged += runnerHandler;
+				target.PropertyChanged += displayHandler;
+				grid.DetachedFromVisualTree += ( _, _ ) =>
+				{
+					target.Runner.StateChanged -= runnerHandler;
+					target.PropertyChanged -= displayHandler;
+				};
+
+				UpdateState();
+
+				Grid.SetColumn( playButton, 1 );
+				grid.Children.Add( playButton );
+
+				return grid;
 			}, supportsRecycling: true )
 		};
 
-		// Single click SELECTS, double click LAUNCHES. They have to be separate
-		// gestures: the toggles are enabled per selection, so if one click did
-		// both there would be no moment in which you could set Steam Runtime or
-		// the terminal option for the run you are about to start.
+		// Selection only — launch is exclusively via the per-row play button.
+		// Single click selects so the Steam Runtime / terminal toggles can be
+		// set before starting; double-click no longer starts a launch.
 		targetList.SelectionChanged += ( _, _ ) => ShowSelected();
 		targetList.Tapped += ( _, e ) =>
 		{
 			if ( IsOnRow( e.Source ) )
 				ShowSelected();
-		};
-		targetList.DoubleTapped += ( _, e ) =>
-		{
-			// Tapped covers the whole ListBox, empty space included.
-			if ( !IsOnRow( e.Source ) )
-				return;
-
-			ShowSelected();
-
-			if ( selected is { Runner.IsRunning: false, Preparing: false } target )
-				Launch( target );
 		};
 
 		steamRuntime = new CheckBox
@@ -130,7 +201,7 @@ internal sealed class MainWindow : Window
 
 		statusText = new TextBlock
 		{
-			Text = "double-click an app to launch it",
+			Text = "select an app and click \u25B6 to launch it",
 			Foreground = TerminalTheme.Normal,
 			FontSize = 12,
 			VerticalAlignment = VerticalAlignment.Center,
@@ -150,12 +221,14 @@ internal sealed class MainWindow : Window
 		Grid.SetColumn( stopButton, 2 );
 		bar.Children.Add( stopButton );
 
-		var right = new Grid { RowDefinitions = new RowDefinitions( "*,Auto" ) };
 		var targetPanel = Surface( targetList, TerminalTheme.TargetPanel, new Thickness( 0, 0, 0, 1 ) );
 		var barPanel = Surface( bar, TerminalTheme.ToolbarPanel, new Thickness( 0 ) );
 
+		var right = new Grid { RowDefinitions = new RowDefinitions( "Auto,*,Auto" ) };
+		right.Children.Add( SidebarHeader( "SHELL SCRIPTS" ) );
+		Grid.SetRow( targetPanel, 1 );
 		right.Children.Add( targetPanel );
-		Grid.SetRow( barPanel, 1 );
+		Grid.SetRow( barPanel, 2 );
 		right.Children.Add( barPanel );
 
 		depCheckButton = SidebarButton( "Check for missing dependencies" );
@@ -164,18 +237,55 @@ internal sealed class MainWindow : Window
 		logFolderButton = SidebarButton( "Open log folder" );
 		logFolderButton.Click += ( _, _ ) => OpenLogFolder();
 
+		replacePathButton = SidebarButton( "Replace s&box path" );
+		replacePathButton.Click += async ( _, _ ) => await PickAndSavePathAsync();
+
+		sboxPathText = new TextBlock
+		{
+			Foreground = TerminalTheme.FooterText,
+			FontSize = 11,
+			TextWrapping = TextWrapping.Wrap,
+			Margin = new Thickness( 10, 6, 10, 0 ),
+			TextTrimming = TextTrimming.CharacterEllipsis
+		};
+
+		// Resolve persisted path now (may be null); heavy prompt is deferred to Opened.
+		resolvedRoot = SboxSettings.Resolve();
+		if ( resolvedRoot is null )
+		{
+			var stale = SboxSettings.GetStalePersistedPath();
+			if ( !string.IsNullOrEmpty( stale ) )
+				resolvedRoot = stale; // keep stale for display, will still prompt
+		}
+		UpdateSboxPathDisplay();
+
+		var sboxLocationPanel = new StackPanel();
+		sboxLocationPanel.Children.Add( SidebarHeader( "S&BOX LOCATION" ) );
+		sboxLocationPanel.Children.Add( sboxPathText );
+		// Replace lives with the location it replaces, not with the generic actions.
+		sboxLocationPanel.Children.Add( replacePathButton );
+
 		var actions = new StackPanel();
 		actions.Children.Add( depCheckButton );
 		actions.Children.Add( logFolderButton );
 
+		var toolsPanel = new StackPanel();
+		toolsPanel.Children.Add( SidebarHeader( "TOOLS" ) );
+		toolsPanel.Children.Add( actions );
+
 		var actionScroll = new ScrollViewer
 		{
-			Content = actions,
-			HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+			Content = toolsPanel,
+			HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled
 		};
 
+		// Left sidebar: S&BOX LOCATION at the very top (with its Replace button),
+		// then TOOLS section grouping the remaining left-panel buttons.
+		// SHELL SCRIPTS header lives on the right panel directly above the
+		// actual script buttons, not above the location block.
 		var left = new Grid { RowDefinitions = new RowDefinitions( "Auto,*,Auto" ) };
-		left.Children.Add( SidebarHeader( "SHELL SCRIPTS" ) );
+		left.Children.Add( sboxLocationPanel );
+
 		Grid.SetRow( actionScroll, 1 );
 		left.Children.Add( actionScroll );
 
@@ -230,6 +340,9 @@ internal sealed class MainWindow : Window
 
 		if ( SystemTerminal.Detect() is null )
 			statusText.Text = "no terminal emulator found - launches will run with their output discarded";
+
+		// Defer path prompt until window is visible so modal has an owner.
+		Opened += async ( _, _ ) => await EnsureSboxRootAsync();
 	}
 
 	/// <summary>True when a pointer event landed on a row rather than the empty
@@ -305,15 +418,49 @@ internal sealed class MainWindow : Window
 		}
 	}
 
+	private string? GetSboxRoot()
+	{
+		if ( !string.IsNullOrEmpty( resolvedRoot ) && SboxSettings.IsValid( resolvedRoot ) )
+			return resolvedRoot;
+
+		var resolved = SboxSettings.Resolve();
+		if ( resolved is not null && SboxSettings.IsValid( resolved ) )
+		{
+			resolvedRoot = resolved;
+			UpdateSboxPathDisplay();
+			return resolved;
+		}
+
+		// Stale persisted path - keep for display but treat as invalid for launch.
+		return null;
+	}
+
 	private async Task LaunchCore( LaunchTarget target )
 	{
-		var root = RepoRoot.Find();
+		var root = GetSboxRoot();
 		if ( root is null )
 		{
-			await Fail( target, "Repo root not found",
-				"ampersand could not locate the s&box tree - it expects game/ and engine/ "
-					+ "somewhere above this binary." );
-			return;
+			var stale = SboxSettings.GetStalePersistedPath() ?? resolvedRoot;
+			var detail = stale is not null
+				? $"Saved s&box path is no longer valid:\n{stale}\n\nExpected a folder containing game/ and engine/ with game/sbox."
+				: "ampersand could not locate the s&box tree - it expects game/ and engine/ "
+					+ "somewhere above this binary.\n\nPick the repository root (e.g. /home/you/sbox).";
+
+			var shouldPick = await ConfirmDialog.Show( this, "s&box location missing", detail, "Select location…", "Cancel" );
+			if ( shouldPick )
+			{
+				if ( await PickAndSavePathAsync() )
+				{
+					root = GetSboxRoot();
+					if ( root is null ) return;
+				}
+				else return;
+			}
+			else
+			{
+				await Fail( target, "Repo root not found", detail );
+				return;
+			}
 		}
 
 		var script = Path.Combine( root, "ampersand", "apps", target.ScriptFile );
@@ -486,12 +633,15 @@ internal sealed class MainWindow : Window
 	{
 		try
 		{
-			var root = RepoRoot.Find();
+			var root = GetSboxRoot();
 			if ( root is null )
 			{
-				await ConfirmDialog.Notify( this, "Repo root not found",
-					"ampersand could not locate the s&box tree - it expects game/ and engine/ "
-						+ "somewhere above this binary." );
+				var stale = SboxSettings.GetStalePersistedPath() ?? resolvedRoot;
+				var detail = stale is not null
+					? $"Saved s&box path is no longer valid:\n{stale}"
+					: "ampersand could not locate the s&box tree - it expects game/ and engine/ "
+						+ "somewhere above this binary.";
+				await ConfirmDialog.Notify( this, "Repo root not found", detail + "\n\nUse Replace s&box path in the sidebar." );
 				return;
 			}
 
@@ -593,8 +743,8 @@ internal sealed class MainWindow : Window
 
 	private void LoadMetadata()
 	{
-		var root = RepoRoot.Find();
-		if ( root is null )
+		var root = GetSboxRoot() ?? SboxSettings.GetStalePersistedPath() ?? RepoRoot.Find();
+		if ( root is null || !RepoRoot.IsValidRoot( root ) )
 			return;
 
 		foreach ( var target in targets )
@@ -606,6 +756,105 @@ internal sealed class MainWindow : Window
 
 			target.Metadata = ScriptMetadata.Read( script );
 			target.UseSniper = target.Metadata.Sniper == SniperMode.Always;
+		}
+	}
+
+	private void UpdateSboxPathDisplay()
+	{
+		if ( sboxPathText is null ) return;
+
+		if ( string.IsNullOrEmpty( resolvedRoot ) )
+		{
+			sboxPathText.Text = "(not set — click Replace s&box path)";
+			ToolTip.SetTip( sboxPathText, "No s&box location saved. Stored in " + SboxSettings.ConfigPath );
+			return;
+		}
+
+		var valid = SboxSettings.IsValid( resolvedRoot );
+		var display = SboxSettings.ShortenForDisplay( resolvedRoot, 42 );
+		sboxPathText.Text = ( valid ? "" : "⚠ stale: " ) + display;
+		ToolTip.SetTip( sboxPathText, resolvedRoot + ( valid ? "" : "\n(stale — folder no longer contains game/ + engine/ + game/sbox)" ) + "\nStored in " + SboxSettings.ConfigPath );
+	}
+
+	private async Task EnsureSboxRootAsync()
+	{
+		if ( sboxRootPromptShown ) return;
+		sboxRootPromptShown = true;
+
+		var valid = !string.IsNullOrEmpty( resolvedRoot ) && SboxSettings.IsValid( resolvedRoot );
+		if ( valid )
+		{
+			statusText.Text = "s&box: " + SboxSettings.ShortenForDisplay( resolvedRoot!, 60 );
+			return;
+		}
+
+		// Try resolve (migration from RepoRoot.Find)
+		var resolved = SboxSettings.Resolve();
+		if ( resolved is not null && SboxSettings.IsValid( resolved ) )
+		{
+			resolvedRoot = resolved;
+			UpdateSboxPathDisplay();
+			LoadMetadata();
+			statusText.Text = "s&box: " + SboxSettings.ShortenForDisplay( resolvedRoot, 60 );
+			UpdateStatusBar();
+			return;
+		}
+
+		// Still missing or stale -> prompt
+		var stale = SboxSettings.GetStalePersistedPath() ?? resolvedRoot;
+		if ( stale is not null && !SboxSettings.IsValid( stale ) )
+			statusText.Text = "s&box location stale: " + stale;
+		else
+			statusText.Text = "Select s&box location — no valid install found";
+
+		await PickAndSavePathAsync( isFirstRun: true );
+	}
+
+	/// <summary>
+	/// Shows the path picker, validates, saves to .local/share.
+	/// Returns true if a valid path was saved.
+	/// </summary>
+	private async Task<bool> PickAndSavePathAsync( bool isFirstRun = false )
+	{
+		while ( true )
+		{
+			var current = resolvedRoot ?? SboxSettings.GetStalePersistedPath();
+			var raw = await PathPickerDialog.Show( this, current );
+
+			if ( raw is null )
+			{
+				// Cancelled. For first-run keep prompt state; otherwise just return.
+				if ( isFirstRun && string.IsNullOrEmpty( resolvedRoot ) )
+					statusText.Text = "Select s&box location to launch (Replace s&box path)";
+				UpdateSboxPathDisplay();
+				return false;
+			}
+
+			var normalized = SboxSettings.Normalize( raw );
+
+			if ( normalized is null || !SboxSettings.IsValid( normalized ) )
+			{
+				var detail = $"Expected a folder containing game/ and engine/ with game/sbox.\n\nYou entered:\n{raw}\n\nNormalized:\n{normalized ?? "(could not resolve)"}";
+				await ConfirmDialog.Notify( this, "Invalid s&box location", detail );
+				continue;
+			}
+
+			try
+			{
+				SboxSettings.Save( normalized );
+			}
+			catch ( Exception e )
+			{
+				await ConfirmDialog.Notify( this, "Could not save settings", e.Message + "\n\nPath: " + SboxSettings.ConfigPath );
+				continue;
+			}
+
+			resolvedRoot = normalized;
+			UpdateSboxPathDisplay();
+			LoadMetadata();
+			statusText.Text = "s&box location: " + SboxSettings.ShortenForDisplay( resolvedRoot, 60 );
+			UpdateStatusBar();
+			return true;
 		}
 	}
 
