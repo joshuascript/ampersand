@@ -26,8 +26,8 @@ internal sealed class MainWindow : Window
 	private readonly Button stopButton;
 	private readonly Button depCheckButton;
 	private readonly Button logFolderButton;
-	private readonly Button replacePathButton;
-	private readonly TextBlock sboxPathText;
+	private readonly TextBox sboxPathBox;
+	private readonly Button browsePathButton;
 	private readonly CheckBox steamRuntime;
 	private readonly CheckBox systemTerminal;
 
@@ -38,7 +38,7 @@ internal sealed class MainWindow : Window
 
 	public MainWindow()
 	{
-		Title = "s&box launcher";
+		Title = "Ampersand";
 		Width = 1040;
 		Height = 660;
 		RequestedThemeVariant = ThemeVariant.Dark;
@@ -237,17 +237,45 @@ internal sealed class MainWindow : Window
 		logFolderButton = SidebarButton( "Open log folder" );
 		logFolderButton.Click += ( _, _ ) => OpenLogFolder();
 
-		replacePathButton = SidebarButton( "Replace s&box path" );
-		replacePathButton.Click += async ( _, _ ) => await PickAndSavePathAsync();
-
-		sboxPathText = new TextBlock
+		// The s&box location is an official feature of the program, not a shell
+		// action, so it gets its own editable field plus a browse button instead
+		// of another ">_" command row. Editing applies on Enter/LostFocus; the
+		// "…" button opens the same picker dialog that first-run uses.
+		sboxPathBox = new TextBox
 		{
-			Foreground = TerminalTheme.FooterText,
 			FontSize = 11,
-			TextWrapping = TextWrapping.Wrap,
-			Margin = new Thickness( 10, 6, 10, 0 ),
-			TextTrimming = TextTrimming.CharacterEllipsis
+			PlaceholderText = "s&box install folder (contains game/ and engine/)",
+			Margin = new Thickness( 10, 6, 0, 0 )
 		};
+		sboxPathBox.KeyDown += ( _, e ) =>
+		{
+			if ( e.Key == Avalonia.Input.Key.Enter )
+				_ = CommitSboxPathBoxAsync();
+		};
+		sboxPathBox.LostFocus += async ( _, _ ) => await CommitSboxPathBoxAsync();
+
+		browsePathButton = new Button
+		{
+			Content = "…",
+			Width = 30,
+			Height = 26,
+			Padding = new Thickness( 0 ),
+			Margin = new Thickness( 6, 6, 10, 0 ),
+			CornerRadius = new CornerRadius( 4 ),
+			VerticalAlignment = VerticalAlignment.Top,
+			HorizontalContentAlignment = HorizontalAlignment.Center,
+			VerticalContentAlignment = VerticalAlignment.Center,
+			Cursor = new Cursor( StandardCursorType.Hand )
+		};
+		ToolTip.SetTip( browsePathButton, "Browse for the s&box install folder" );
+		browsePathButton.Styles.Add( PresenterFill( ":pointerover", TerminalTheme.SidebarHover ) );
+		browsePathButton.Styles.Add( PresenterFill( ":pressed", TerminalTheme.SidebarPressed ) );
+		browsePathButton.Click += async ( _, _ ) => await PickAndSavePathAsync();
+
+		var sboxPathRow = new Grid { ColumnDefinitions = new ColumnDefinitions( "*,Auto" ) };
+		sboxPathRow.Children.Add( sboxPathBox );
+		Grid.SetColumn( browsePathButton, 1 );
+		sboxPathRow.Children.Add( browsePathButton );
 
 		// Resolve persisted path now (may be null); heavy prompt is deferred to Opened.
 		resolvedRoot = SboxSettings.Resolve();
@@ -261,9 +289,7 @@ internal sealed class MainWindow : Window
 
 		var sboxLocationPanel = new StackPanel();
 		sboxLocationPanel.Children.Add( SidebarHeader( "S&BOX LOCATION" ) );
-		sboxLocationPanel.Children.Add( sboxPathText );
-		// Replace lives with the location it replaces, not with the generic actions.
-		sboxLocationPanel.Children.Add( replacePathButton );
+		sboxLocationPanel.Children.Add( sboxPathRow );
 
 		var actions = new StackPanel();
 		actions.Children.Add( depCheckButton );
@@ -279,18 +305,18 @@ internal sealed class MainWindow : Window
 			HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled
 		};
 
-		// Left sidebar: S&BOX LOCATION at the very top (with its Replace button),
-		// then TOOLS section grouping the remaining left-panel buttons.
+		// Left sidebar, top to bottom: TOOLS at the very top, then the S&BOX
+		// LOCATION field pinned just above the permanent advisory footer.
 		// SHELL SCRIPTS header lives on the right panel directly above the
 		// actual script buttons, not above the location block.
-		var left = new Grid { RowDefinitions = new RowDefinitions( "Auto,*,Auto" ) };
-		left.Children.Add( sboxLocationPanel );
-
-		Grid.SetRow( actionScroll, 1 );
+		var left = new Grid { RowDefinitions = new RowDefinitions( "Auto,*,Auto,Auto" ) };
 		left.Children.Add( actionScroll );
 
+		Grid.SetRow( sboxLocationPanel, 2 );
+		left.Children.Add( sboxLocationPanel );
+
 		var footer = SidebarFooter( "SHARE SCRIPTS AT YOUR OWN RISK" );
-		Grid.SetRow( footer, 2 );
+		Grid.SetRow( footer, 3 );
 		left.Children.Add( footer );
 
 		var root = new Grid { ColumnDefinitions = new ColumnDefinitions( "25*,75*" ) };
@@ -787,19 +813,76 @@ internal sealed class MainWindow : Window
 
 	private void UpdateSboxPathDisplay()
 	{
-		if ( sboxPathText is null ) return;
+		if ( sboxPathBox is null ) return;
 
 		if ( string.IsNullOrEmpty( resolvedRoot ) )
 		{
-			sboxPathText.Text = "(not set — click Replace s&box path)";
-			ToolTip.SetTip( sboxPathText, "No s&box location saved. Stored in " + SboxSettings.ConfigPath );
+			sboxPathBox.Text = "";
+			ToolTip.SetTip( sboxPathBox, "No s&box location saved. Stored in " + SboxSettings.ConfigPath );
 			return;
 		}
 
 		var valid = SboxSettings.IsValid( resolvedRoot );
 		var display = SboxSettings.ShortenForDisplay( resolvedRoot, 42 );
-		sboxPathText.Text = ( valid ? "" : "⚠ stale: " ) + display;
-		ToolTip.SetTip( sboxPathText, resolvedRoot + ( valid ? "" : "\n(stale — folder no longer contains game/ + engine/ + game/sbox)" ) + "\nStored in " + SboxSettings.ConfigPath );
+		sboxPathBox.Text = valid ? display : "⚠ stale: " + display;
+		ToolTip.SetTip( sboxPathBox, resolvedRoot + ( valid ? "" : "\n(stale — folder no longer contains game/ + engine/ + game/sbox)" ) + "\nStored in " + SboxSettings.ConfigPath );
+	}
+
+	/// <summary>
+	/// Commits whatever is in the editable location field, reusing the same
+	/// validate->save->refresh path the picker dialog uses. The field is left
+	/// alone on a failed attempt so the user can correct it in place.
+	/// </summary>
+	private async Task CommitSboxPathBoxAsync()
+	{
+		if ( sboxPathBox is null ) return;
+
+		var raw = sboxPathBox.Text?.Trim();
+		if ( string.IsNullOrEmpty( raw ) )
+		{
+			// Empty field reverts to the persisted/resolved value on next refresh.
+			UpdateSboxPathDisplay();
+			return;
+		}
+
+		if ( await ApplySboxPathAsync( raw ) )
+			UpdateSboxPathDisplay();
+	}
+
+	/// <summary>
+	/// Normalizes, validates, and persists a raw s&box path; on success refreshes
+	/// the location field and status. True when a valid path was saved.
+	/// Loops only inside the picker path, which needs retry on dialog use.
+	/// </summary>
+	private async Task<bool> ApplySboxPathAsync( string? raw )
+	{
+		if ( string.IsNullOrWhiteSpace( raw ) ) return false;
+
+		var normalized = SboxSettings.Normalize( raw );
+
+		if ( normalized is null || !SboxSettings.IsValid( normalized ) )
+		{
+			var detail = $"Expected a folder containing game/ and engine/ with game/sbox.\n\nYou entered:\n{raw}\n\nNormalized:\n{normalized ?? "(could not resolve)"}";
+			await ConfirmDialog.Notify( this, "Invalid s&box location", detail );
+			return false;
+		}
+
+		try
+		{
+			SboxSettings.Save( normalized );
+		}
+		catch ( Exception e )
+		{
+			await ConfirmDialog.Notify( this, "Could not save settings", e.Message + "\n\nPath: " + SboxSettings.ConfigPath );
+			return false;
+		}
+
+		resolvedRoot = normalized;
+		UpdateSboxPathDisplay();
+		LoadMetadata();
+		statusText.Text = "s&box location: " + SboxSettings.ShortenForDisplay( resolvedRoot, 60 );
+		UpdateStatusBar();
+		return true;
 	}
 
 	private async Task EnsureSboxRootAsync()
@@ -839,6 +922,7 @@ internal sealed class MainWindow : Window
 	/// <summary>
 	/// Shows the path picker, validates, saves to .local/share.
 	/// Returns true if a valid path was saved.
+	/// The validate/save core is shared with the in-place field edit.
 	/// </summary>
 	private async Task<bool> PickAndSavePathAsync( bool isFirstRun = false )
 	{
@@ -851,36 +935,13 @@ internal sealed class MainWindow : Window
 			{
 				// Cancelled. For first-run keep prompt state; otherwise just return.
 				if ( isFirstRun && string.IsNullOrEmpty( resolvedRoot ) )
-					statusText.Text = "Select s&box location to launch (Replace s&box path)";
+					statusText.Text = "Select s&box location to launch";
 				UpdateSboxPathDisplay();
 				return false;
 			}
 
-			var normalized = SboxSettings.Normalize( raw );
-
-			if ( normalized is null || !SboxSettings.IsValid( normalized ) )
-			{
-				var detail = $"Expected a folder containing game/ and engine/ with game/sbox.\n\nYou entered:\n{raw}\n\nNormalized:\n{normalized ?? "(could not resolve)"}";
-				await ConfirmDialog.Notify( this, "Invalid s&box location", detail );
-				continue;
-			}
-
-			try
-			{
-				SboxSettings.Save( normalized );
-			}
-			catch ( Exception e )
-			{
-				await ConfirmDialog.Notify( this, "Could not save settings", e.Message + "\n\nPath: " + SboxSettings.ConfigPath );
-				continue;
-			}
-
-			resolvedRoot = normalized;
-			UpdateSboxPathDisplay();
-			LoadMetadata();
-			statusText.Text = "s&box location: " + SboxSettings.ShortenForDisplay( resolvedRoot, 60 );
-			UpdateStatusBar();
-			return true;
+			if ( await ApplySboxPathAsync( raw ) )
+				return true;
 		}
 	}
 
