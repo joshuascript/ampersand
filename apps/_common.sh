@@ -58,6 +58,11 @@ sbox_exec()
 	LD_LIBRARY_PATH="$NATIVE_DIR${SBOX_SNIPER_COMPAT:+:$SBOX_SNIPER_COMPAT}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 	export LD_PRELOAD LD_LIBRARY_PATH
 
+	# Wayland's Qt platform plugin is not shipped/unstable; force X11 (xcb)
+	# via XWayland (only xcb is bundled - "Available platform plugins are: xcb").
+	QT_QPA_PLATFORM=xcb
+	export QT_QPA_PLATFORM
+
 	cd "$GAME_DIR"
 	exec "$_exe" "$@"
 }
