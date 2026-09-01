@@ -25,6 +25,7 @@ internal sealed class MainWindow : Window
 	private readonly TextBlock statusText;
 	private readonly Button stopButton;
 	private readonly Button depCheckButton;
+	private readonly Button logFolderButton;
 	private readonly CheckBox steamRuntime;
 	private readonly CheckBox systemTerminal;
 
@@ -160,8 +161,12 @@ internal sealed class MainWindow : Window
 		depCheckButton = SidebarButton( "Check for missing dependencies" );
 		depCheckButton.Click += ( _, _ ) => RunDependencyCheck();
 
+		logFolderButton = SidebarButton( "Open log folder" );
+		logFolderButton.Click += ( _, _ ) => OpenLogFolder();
+
 		var actions = new StackPanel();
 		actions.Children.Add( depCheckButton );
+		actions.Children.Add( logFolderButton );
 
 		var actionScroll = new ScrollViewer
 		{
@@ -195,6 +200,21 @@ internal sealed class MainWindow : Window
 
 				if ( ReferenceEquals( captured, selected ) )
 					UpdateStatusBar();
+
+				// Non-zero exit: show Avalonia tail dialog (always close konsole, tail here).
+				// Only for botched runs; success keeps log silently.
+				if ( !captured.Runner.IsRunning && captured.Runner.ExitCode is int code && code != 0 )
+				{
+					var log = captured.Runner.LastLogPath;
+					if ( !string.IsNullOrEmpty( log ) )
+					{
+						// Post to UI thread; StateChanged already on UI thread but be safe.
+						Avalonia.Threading.Dispatcher.UIThread.Post( () =>
+						{
+							ShowTailDialog( captured, log, code );
+						} );
+					}
+				}
 			};
 
 			// The runner's own lines used to be written into that target's pane.
@@ -303,7 +323,15 @@ internal sealed class MainWindow : Window
 			return;
 		}
 
-		var env = new Dictionary<string, string> { ["SBOX_REPO_ROOT"] = root };
+		var env = new Dictionary<string, string>
+		{
+			["SBOX_REPO_ROOT"] = root,
+			// Wayland Qt plugin not shipped/supported - force xcb (XWayland).
+			// Only xcb is bundled ("Available platform plugins are: xcb").
+			// Set here so it crosses the Steam Runtime container boundary via --env;
+			// _common.sh also hard-sets it for direct script runs.
+			["QT_QPA_PLATFORM"] = "xcb"
+		};
 		var command = new List<string>();
 
 		// Held across the await below, not just the spawn: PrepareSniper can sit
@@ -510,6 +538,33 @@ internal sealed class MainWindow : Window
 		}
 	}
 
+	private async void ShowTailDialog( LaunchTarget target, string logPath, int code )
+	{
+		try
+		{
+			statusText.Text = target.Name + $": exited {code} - log: {logPath}";
+			await ConfirmDialog.NotifyTail( this, target.Name + " failed", logPath, code );
+		}
+		catch { }
+	}
+
+	private void OpenLogFolder()
+	{
+		try
+		{
+			var dir = RunLog.LogDirectory;
+			Directory.CreateDirectory( dir );
+			if ( !RunLog.TryOpenFolder() )
+				statusText.Text = "log folder: " + dir;
+			else
+				statusText.Text = "opened log folder: " + dir;
+		}
+		catch ( Exception e )
+		{
+			statusText.Text = "could not open log folder - " + e.Message;
+		}
+	}
+
 	private void UpdateStatusBar()
 	{
 		if ( selected is null )
@@ -525,9 +580,11 @@ internal sealed class MainWindow : Window
 			statusText.Text = "preparing - " + runner.Name;
 		else if ( runner.IsRunning )
 			statusText.Text = ( selected.UseSystemTerminal ? "running in a terminal - " : "running - " )
-				+ runner.Name;
+				+ runner.Name
+				+ ( runner.LastLogPath is not null ? " - log: " + runner.LastLogPath : "" );
 		else if ( runner.ExitCode is int code )
-			statusText.Text = "exited " + code + " - " + runner.Name;
+			statusText.Text = "exited " + code + " - " + runner.Name
+				+ ( runner.LastLogPath is not null ? " - log: " + runner.LastLogPath : "" );
 		else
 			statusText.Text = "idle - " + runner.Name;
 

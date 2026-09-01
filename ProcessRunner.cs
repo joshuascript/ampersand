@@ -1,6 +1,8 @@
+#pragma warning disable CA2000
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 
 namespace Ampersand;
 
@@ -43,6 +45,7 @@ internal sealed class ProcessRunner
 	public string Name { get; }
 	public bool IsRunning { get; private set; }
 	public int? ExitCode { get; private set; }
+	public string? LastLogPath { get; private set; }
 
 	/// <summary>Launcher-generated status lines, already on the UI thread.</summary>
 	public event Action<string>? Notice;
@@ -76,9 +79,28 @@ internal sealed class ProcessRunner
 		string workingDirectory,
 		IReadOnlyDictionary<string, string> extraEnv )
 	{
-		if ( !SystemTerminal.TryBuild( command, out var argv, out var emulator ) )
+		// Always log: wrap command with bash tee wrapper on the host so konsole
+		// still shows output but a copy lands in ~/.cache/sbox-ampersand/logs.
+		LastLogPath = RunLog.CreateLogPath( Name );
+
+		if ( !BashAvailable() )
 		{
-			Notice?.Invoke( "no terminal emulator found - install one, or untick Launch with system terminal." );
+			Notice?.Invoke( "bash not found - logging to file instead." );
+			StartInBackground( command, workingDirectory, extraEnv );
+			return;
+		}
+
+		var wrapper = RunLog.EnsureWrapper();
+
+		// wrapper.sh <log> <original command...>
+		var wrapped = new List<string> { wrapper, LastLogPath };
+		wrapped.AddRange( command );
+
+		if ( !SystemTerminal.TryBuild( wrapped, out var argv, out var emulator ) )
+		{
+			// Fallback: no terminal -> background log capture (logs only).
+			Notice?.Invoke( "no terminal emulator found - logging to file instead." );
+			StartInBackground( command, workingDirectory, extraEnv );
 			return;
 		}
 
@@ -88,30 +110,38 @@ internal sealed class ProcessRunner
 			return;
 		}
 
-		Notice?.Invoke( "running in " + emulator + " - output is in that window." );
+		Notice?.Invoke( "running in " + emulator + " - log: " + LastLogPath );
 		StateChanged?.Invoke( this );
 	}
 
 	/// <summary>
-	/// No window and no output. The streams are still redirected and drained:
-	/// left inherited they would land on whatever stdout ampersand itself was
-	/// given, which from a desktop launcher is nothing and from a terminal is
-	/// that terminal - neither of them a decision this mode gets to make. An
-	/// undrained pipe would also stall the child once its 64K buffer filled,
-	/// which is a hang rather than a discard.
+	/// No window: capture stdout/stderr directly to log file in ~/.cache.
+	/// Used when "Launch with system terminal" is unticked, or as fallback
+	/// when no emulator is installed (logs only).
 	/// </summary>
 	private void StartInBackground(
 		IReadOnlyList<string> command,
 		string workingDirectory,
 		IReadOnlyDictionary<string, string> extraEnv )
 	{
-		if ( !TryStart( command, workingDirectory, extraEnv, redirect: true, out var problem ) )
+		// Reuse existing log if StartInTerminal already created one for fallback.
+		LastLogPath ??= RunLog.CreateLogPath( Name );
+
+		// Ensure file exists with header.
+		try
+		{
+			if ( !File.Exists( LastLogPath ) )
+				File.WriteAllText( LastLogPath, $"--- {Name} {DateTime.Now:O} ---{Environment.NewLine}" );
+		}
+		catch { }
+
+		if ( !TryStart( command, workingDirectory, extraEnv, redirect: true, out var problem, LastLogPath ) )
 		{
 			Notice?.Invoke( "could not start - " + problem );
 			return;
 		}
 
-		Notice?.Invoke( "running in the background - output is discarded." );
+		Notice?.Invoke( "running in background - log: " + LastLogPath );
 		StateChanged?.Invoke( this );
 	}
 
@@ -120,7 +150,8 @@ internal sealed class ProcessRunner
 		string workingDirectory,
 		IReadOnlyDictionary<string, string> extraEnv,
 		bool redirect,
-		out string problem )
+		out string problem,
+		string? logPath = null )
 	{
 		problem = string.Empty;
 
@@ -143,8 +174,29 @@ internal sealed class ProcessRunner
 		{
 			process = new Process { StartInfo = info, EnableRaisingEvents = true };
 
+			// For background mode, capture output directly to log file.
+			object logLock = new();
+			StreamWriter? logWriter = null;
+			FileStream? logStream = null;
+			if ( redirect && logPath is not null )
+			{
+				try
+				{
+					logStream = new FileStream( logPath, FileMode.Append, FileAccess.Write, FileShare.Read );
+					logWriter = new StreamWriter( logStream ) { AutoFlush = true };
+				}
+				catch
+				{
+					logWriter = null;
+					try { logStream?.Dispose(); } catch { }
+					logStream = null;
+				}
+			}
+
 			process.Exited += ( _, _ ) => Post( () =>
 			{
+				try { logWriter?.Flush(); logWriter?.Dispose(); } catch { }
+				try { logStream?.Dispose(); } catch { }
 				ExitCode = SafeExitCode( process );
 				IsRunning = false;
 				StateChanged?.Invoke( this );
@@ -152,8 +204,31 @@ internal sealed class ProcessRunner
 
 			if ( redirect )
 			{
-				process.OutputDataReceived += ( _, _ ) => { };
-				process.ErrorDataReceived += ( _, _ ) => { };
+				if ( logWriter is not null )
+				{
+					process.OutputDataReceived += ( _, e ) =>
+					{
+						if ( e.Data is null ) return;
+						lock ( logLock )
+						{
+							try { logWriter.WriteLine( e.Data ); } catch { }
+						}
+					};
+					process.ErrorDataReceived += ( _, e ) =>
+					{
+						if ( e.Data is null ) return;
+						lock ( logLock )
+						{
+							try { logWriter.WriteLine( e.Data ); } catch { }
+						}
+					};
+				}
+				else
+				{
+					// Fallback discard (original behavior) if log open failed.
+					process.OutputDataReceived += ( _, _ ) => { };
+					process.ErrorDataReceived += ( _, _ ) => { };
+				}
 			}
 
 			process.Start();
@@ -203,6 +278,22 @@ internal sealed class ProcessRunner
 
 	private static void Post( Action action )
 	{
-		Avalonia.Threading.Dispatcher.UIThread.Post( action );
+		try
+		{
+			var dispatcher = Avalonia.Threading.Dispatcher.UIThread;
+			// In unit/headless context dispatcher may not be initialized; fall back to direct invoke.
+			if ( dispatcher != null )
+			{
+				dispatcher.Post( action );
+				return;
+			}
+		}
+		catch { }
+		action();
+	}
+
+	private static bool BashAvailable()
+	{
+		return File.Exists( "/bin/bash" ) || File.Exists( "/usr/bin/bash" );
 	}
 }

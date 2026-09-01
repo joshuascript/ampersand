@@ -1,6 +1,7 @@
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Styling;
@@ -33,6 +34,103 @@ internal static class ConfirmDialog
 	public static Task Notify( Window owner, string title, string message, string dismiss = "OK" )
 	{
 		return Build( owner, title, message, dismiss, null );
+	}
+
+	/// <summary>
+	/// Non-zero exit tail dialog: Avalonia dialog showing last ~80 lines
+	/// of the log, with actions to open the log file/folder.
+	/// Always closes (no read-pause in konsole), tail is shown here.
+	/// </summary>
+	public static Task<bool> NotifyTail( Window owner, string title, string logPath, int exitCode )
+	{
+		var tail = RunLog.Tail( logPath, 80, 6000 );
+
+		var dialog = new Window
+		{
+			Title = title,
+			Width = 760,
+			Height = 520,
+			CanResize = true,
+			WindowStartupLocation = WindowStartupLocation.CenterOwner,
+			RequestedThemeVariant = ThemeVariant.Dark,
+			Background = TerminalTheme.ToolbarPanel
+		};
+
+		var logView = new SelectableTextBlock
+		{
+			Text = tail,
+			TextWrapping = TextWrapping.Wrap,
+			FontFamily = new FontFamily( "DejaVu Sans Mono" ),
+			FontSize = 11,
+			Foreground = TerminalTheme.Normal
+		};
+
+		var scroll = new ScrollViewer
+		{
+			Content = logView,
+			HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+			VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+			MaxHeight = 340,
+			Background = TerminalTheme.Background
+		};
+		var scrollBorder = new Border
+		{
+			BorderBrush = TerminalTheme.PanelBorder,
+			BorderThickness = new Thickness( 1 ),
+			Padding = new Thickness( 8 ),
+			Child = scroll
+		};
+
+		var pathText = new SelectableTextBlock
+		{
+			Text = logPath,
+			TextWrapping = TextWrapping.Wrap,
+			FontSize = 11,
+			Foreground = TerminalTheme.FooterText
+		};
+
+		var openFolderBtn = new Button { Content = "Open log folder" };
+		openFolderBtn.Click += ( _, _ ) =>
+		{
+			RunLog.TryOpenFolder( logPath );
+		};
+
+		var openFileBtn = new Button { Content = "Open log file" };
+		openFileBtn.Click += ( _, _ ) =>
+		{
+			if ( !RunLog.TryOpenFile( logPath ) )
+				RunLog.TryOpenFolder( logPath );
+		};
+
+		var dismissBtn = new Button { Content = "OK", IsDefault = true };
+		dismissBtn.Click += ( _, _ ) => dialog.Close( true );
+
+		var buttons = new StackPanel
+		{
+			Orientation = Orientation.Horizontal,
+			Spacing = 8,
+			HorizontalAlignment = HorizontalAlignment.Right,
+			Margin = new Thickness( 0, 12, 0, 0 )
+		};
+		buttons.Children.Add( openFolderBtn );
+		buttons.Children.Add( openFileBtn );
+		buttons.Children.Add( dismissBtn );
+
+		var body = new StackPanel { Margin = new Thickness( 16 ) };
+		body.Children.Add( new TextBlock
+		{
+			Text = $"{title} (exit {exitCode})",
+			FontWeight = FontWeight.SemiBold,
+			Foreground = TerminalTheme.HeaderText,
+			Margin = new Thickness( 0, 0, 0, 6 )
+		} );
+		body.Children.Add( pathText );
+		body.Children.Add( new TextBlock { Height = 8 } );
+		body.Children.Add( scrollBorder );
+		body.Children.Add( buttons );
+
+		dialog.Content = body;
+		return dialog.ShowDialog<bool>( owner );
 	}
 
 	/// <summary>
