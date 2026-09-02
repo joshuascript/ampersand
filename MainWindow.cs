@@ -25,6 +25,7 @@ internal sealed class MainWindow : Window
 	private readonly TextBlock statusText;
 	private readonly Button stopButton;
 	private readonly Button depCheckButton;
+	private readonly Button bootstrapButton;
 	private readonly Button logFolderButton;
 	private readonly TextBox sboxPathBox;
 	private readonly Button browsePathButton;
@@ -234,6 +235,10 @@ internal sealed class MainWindow : Window
 		depCheckButton = SidebarButton( "Check for missing dependencies" );
 		depCheckButton.Click += ( _, _ ) => RunDependencyCheck();
 
+		bootstrapButton = SidebarButton( "Build S&Box" );
+		bootstrapButton.Click += ( _, _ ) => RunBootstrap( skipDeps: false );
+		ToolTip.SetTip( bootstrapButton, "Fetch natives, check dependencies, then build - port of sbox-public/bootstrap.sh" );
+
 		logFolderButton = SidebarButton( "Open log folder" );
 		logFolderButton.Click += ( _, _ ) => OpenLogFolder();
 
@@ -292,6 +297,7 @@ internal sealed class MainWindow : Window
 		sboxLocationPanel.Children.Add( sboxPathRow );
 
 		var actions = new StackPanel();
+		actions.Children.Add( bootstrapButton );
 		actions.Children.Add( depCheckButton );
 		actions.Children.Add( logFolderButton );
 
@@ -723,6 +729,63 @@ internal sealed class MainWindow : Window
 		catch ( Exception e )
 		{
 			statusText.Text = "dependency check failed - " + e.Message;
+		}
+	}
+
+	private async void RunBootstrap( bool skipDeps )
+	{
+		try
+		{
+			var root = GetSboxRoot();
+			if ( root is null )
+			{
+				var stale = SboxSettings.GetStalePersistedPath() ?? resolvedRoot;
+				var detail = stale is not null
+					? $"Saved s&box path is no longer valid:\n{stale}"
+					: "ampersand could not locate the s&box tree - it expects game/ and engine/ "
+						+ "somewhere above this binary.";
+				await ConfirmDialog.Notify( this, "Repo root not found", detail + "\n\nUse Replace s&box path in the sidebar." );
+				return;
+			}
+
+			var self = Environment.ProcessPath;
+			if ( self is null )
+			{
+				await ConfirmDialog.Notify( this, "Cannot re-exec",
+					"ampersand could not determine its own path, so it cannot run bootstrap in a terminal." );
+				return;
+			}
+
+			var args = new List<string> { self, Program.BootstrapArgument };
+			if ( skipDeps ) args.Add( "--skip-deps" );
+
+			if ( !SystemTerminal.TryBuild( args, out var argv, out var emulator ) )
+			{
+				await ConfirmDialog.Notify( this, "No terminal emulator",
+					"Bootstrap prints a coloured build log, so it needs a terminal "
+						+ "window - and no emulator was found on PATH.\n\n"
+						+ "Install one (gnome-terminal, konsole, alacritty, kitty, foot, xterm...), "
+						+ "or run it yourself:\n\n"
+						+ self + " " + Program.BootstrapArgument + ( skipDeps ? " --skip-deps" : "" ) );
+				return;
+			}
+
+			var info = new ProcessStartInfo
+			{
+				FileName = argv[0],
+				WorkingDirectory = root,
+				UseShellExecute = false
+			};
+
+			for ( var i = 1; i < argv.Count; i++ )
+				info.ArgumentList.Add( argv[i] );
+
+			Process.Start( info );
+			statusText.Text = "bootstrap running in " + emulator;
+		}
+		catch ( Exception e )
+		{
+			statusText.Text = "bootstrap failed - " + e.Message;
 		}
 	}
 
