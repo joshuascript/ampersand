@@ -27,11 +27,12 @@ internal static class Program
 
 	private static int DependencyCheckMain()
 	{
-		var root = RepoRoot.Find();
+		var root = SboxSettings.Resolve() ?? RepoRoot.Find();
 
 		if ( root is null )
 		{
 			Console.Error.WriteLine( "ampersand: could not locate the repo root - expected game/ and engine/ above this binary" );
+			Console.Error.WriteLine( "hint: set it in the launcher (Replace s&box path) or run from the repo checkout" );
 			return 1;
 		}
 

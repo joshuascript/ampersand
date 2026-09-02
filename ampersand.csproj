@@ -16,7 +16,11 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<None Include="apps\**" CopyToOutputDirectory="Never" />
+		<None Include="apps\**" CopyToOutputDirectory="PreserveNewest" Link="scripts\%(RecursiveDir)%(Filename)%(Extension)" />
 	</ItemGroup>
+
+	<Target Name="MakeScriptsExecutable" AfterTargets="Build" Condition="'$(OS)' != 'Windows_NT'">
+		<Exec Command="chmod +x &quot;$(OutDir)scripts&quot;/*.sh 2>/dev/null || true" />
+	</Target>
 
 </Project>

@@ -32,8 +32,14 @@
 set -eu
 
 # The launcher passes SBOX_REPO_ROOT; the fallback keeps the script usable by
-# hand from ampersand/apps/.
-ROOT="${SBOX_REPO_ROOT:-$( cd "$( dirname "$0" )/../.." && pwd )}"
+# hand from the built scripts dir (OutDir/scripts/) or from repo/apps/.
+# When built, scripts live at <OutDir>/scripts/ so dirname $0 is .../scripts
+# (parent = build output); in repo they are at ampersand/apps (parent/parent = sbox root).
+# Try scripts/ layout first, then legacy apps/ layout.
+ROOT="${SBOX_REPO_ROOT:-$( cd "$( dirname "$0" )/.." 2>/dev/null && pwd )}"
+if [ ! -d "$ROOT/game" ] || [ ! -d "$ROOT/engine" ]; then
+	ROOT="${SBOX_REPO_ROOT:-$( cd "$( dirname "$0" )/../.." && pwd )}"
+fi
 GAME_DIR="$ROOT/game"
 NATIVE_DIR="$GAME_DIR/bin/linuxsteamrt64"
 
