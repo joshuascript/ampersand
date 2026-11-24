@@ -103,6 +103,14 @@ internal static class CaseAliases
 		public string? Root { get; set; }
 		public List<string>? Files { get; set; }
 		public List<string>? Dirs { get; set; }
+
+		/// <summary>
+		/// Link path (as it appears in <see cref="Files"/>) -> the file it was
+		/// pointing at when it was made. Recording the target is what lets a
+		/// revert distinguish its own link from a same-named link that was later
+		/// retargeted by hand; links with no recorded target are never removed.
+		/// </summary>
+		public Dictionary<string, string>? Targets { get; set; }
 	}
 
 	/// <summary>
@@ -166,6 +174,7 @@ internal static class CaseAliases
 			var created = new List<string>();
 			var createdDirs = new HashSet<string>( StringComparer.Ordinal );
 			var ours = new List<string>();
+			var targets = new Dictionary<string, string>( StringComparer.Ordinal );
 			int sources = 0, linked = 0, already = 0, conflicts = 0, collisions = 0, reported = 0;
 
 			foreach ( var root in roots )
@@ -252,6 +261,7 @@ internal static class CaseAliases
 						linked++;
 						created.Add( targetAbs );
 						ours.Add( RepoRelative( repoRoot, targetAbs ) );
+						targets[RepoRelative( repoRoot, targetAbs )] = RepoRelative( repoRoot, sourceAbs );
 					}
 					catch ( Exception e ) when ( e is IOException or UnauthorizedAccessException )
 					{
@@ -263,7 +273,7 @@ internal static class CaseAliases
 
 			if ( !dryRun )
 			{
-				WriteJournal( repoRoot, ours, createdDirs );
+				AddToJournal( repoRoot, ours, createdDirs, targets );
 				CheckGitIgnore( repoRoot, created, Report );
 			}
 
@@ -277,7 +287,8 @@ internal static class CaseAliases
 	}
 
 	/// <summary>
-	/// Removes exactly the links <see cref="Ensure"/> recorded in its journal,
+	/// Removes exactly the links <see cref="Ensure"/> (and
+	/// <see cref="ContentTwins.Repair"/>, which shares the journal) recorded,
 	/// then the directories it created that are now empty. A missing journal
 	/// means nothing is removed: the engine's own sibling links live in the
 	/// same trees and must survive. Idempotent.
@@ -297,15 +308,25 @@ internal static class CaseAliases
 			}
 
 			var roots = Roots( repoRoot );
-			var files = ( journal.Files ?? new List<string>() )
-				.Select( f => Path.GetFullPath( Path.Combine( repoRoot, f ) ) ).ToList();
+			var recorded = journal.Targets ?? new Dictionary<string, string>( StringComparer.Ordinal );
+			var entries = ( journal.Files ?? new List<string>() ).ToList();
 			var dirs = ( journal.Dirs ?? new List<string>() )
 				.Select( d => Path.GetFullPath( Path.Combine( repoRoot, d ) ) ).ToList();
 
 			int removed = 0, skipped = 0, kept = 0;
-			foreach ( var link in files )
+			foreach ( var entry in entries )
 			{
-				if ( !LooksLikeOurs( roots, link ) ) { skipped++; continue; }
+				var link = Path.GetFullPath( Path.Combine( repoRoot, entry ) );
+
+				// A recorded link is ours only while it still points at the file
+				// it did when we made it - a retargeted alias (image or include)
+				// is someone else's now. Entries from a journal written before
+				// targets were recorded fall back to the derivable image shape.
+				var ours = recorded.TryGetValue( entry, out var target )
+					? LooksLikeRecorded( repoRoot, link, target )
+					: LooksLikeOurs( roots, link );
+
+				if ( !ours ) { skipped++; continue; }
 				if ( !dryRun )
 				{
 					try { File.Delete( link ); }
@@ -335,6 +356,7 @@ internal static class CaseAliases
 			if ( !dryRun )
 			{
 				try { File.Delete( JournalPath( repoRoot ) ); } catch { }
+				ClearExcludeBlock( repoRoot );
 			}
 
 			return new RevertResult( removed, removedDirs, kept, skipped, dryRun, null );
@@ -465,22 +487,32 @@ internal static class CaseAliases
 
 	/// <summary>
 	/// Unions with the existing journal: a run that creates nothing must not
-	/// forget the links and directories an earlier run created.
+	/// forget the links and directories an earlier run created. Returns false
+	/// when the record could not be written - the caller must say so, because
+	/// the links then exist without a revert path.
 	/// </summary>
-	private static void WriteJournal( string repoRoot, IEnumerable<string> files, IEnumerable<string> dirs )
+	internal static bool AddToJournal(
+		string repoRoot, IEnumerable<string> files, IEnumerable<string> dirs,
+		IReadOnlyDictionary<string, string>? targets = null )
 	{
 		try
 		{
 			var existing = ReadJournal( repoRoot );
 			var allFiles = new HashSet<string>( StringComparer.Ordinal );
 			var allDirs = new HashSet<string>( StringComparer.Ordinal );
+			var allTargets = new Dictionary<string, string>( StringComparer.Ordinal );
 
 			foreach ( var file in files ) allFiles.Add( file );
 			foreach ( var dir in dirs ) allDirs.Add( dir );
+			if ( targets is not null )
+				foreach ( var pair in targets ) allTargets[pair.Key] = pair.Value;
+
 			if ( existing is not null )
 			{
 				foreach ( var file in existing.Files ?? new List<string>() ) allFiles.Add( file );
 				foreach ( var dir in existing.Dirs ?? new List<string>() ) allDirs.Add( dir );
+				if ( existing.Targets is not null )
+					foreach ( var pair in existing.Targets ) allTargets[pair.Key] = pair.Value;
 			}
 
 			var path = JournalPath( repoRoot );
@@ -490,14 +522,21 @@ internal static class CaseAliases
 			{
 				Root = Path.GetFullPath( repoRoot ),
 				Files = allFiles.OrderBy( x => x, StringComparer.Ordinal ).ToList(),
-				Dirs = allDirs.OrderBy( x => x, StringComparer.Ordinal ).ToList()
+				Dirs = allDirs.OrderBy( x => x, StringComparer.Ordinal ).ToList(),
+				Targets = allTargets.Count > 0
+					? allTargets.OrderBy( x => x.Key, StringComparer.Ordinal )
+						.ToDictionary( x => x.Key, x => x.Value, StringComparer.Ordinal )
+					: null
 			};
 
-			var temp = path + ".tmp";
+			// Per-process temp: two runs writing the same fixed name would
+			// otherwise interleave into one file.
+			var temp = path + "." + Environment.ProcessId + ".tmp";
 			File.WriteAllText( temp, JsonSerializer.Serialize( journal, JsonOptions ) );
 			File.Move( temp, path, true );
+			return true;
 		}
-		catch { }
+		catch { return false; }
 	}
 
 	// ---- git noise -------------------------------------------------------
@@ -507,7 +546,7 @@ internal static class CaseAliases
 	/// this normally does nothing. If an extension is ever un-ignored upstream,
 	/// list the visible paths in .git/info/exclude (local, untracked) and say so.
 	/// </summary>
-	private static void CheckGitIgnore( string repoRoot, IReadOnlyList<string> created, Action<string> log )
+	internal static void CheckGitIgnore( string repoRoot, IReadOnlyList<string> created, Action<string> log )
 	{
 		if ( created.Count == 0 ) return;
 		if ( !Directory.Exists( Path.Combine( repoRoot, ".git" ) ) ) return;
@@ -571,6 +610,39 @@ internal static class CaseAliases
 		catch { return null; }
 	}
 
+	/// <summary>
+	/// Drops the generated block after a revert removed the links it hid.
+	/// Nothing it covers is left, and a stale block would keep naming paths
+	/// that no longer exist.
+	/// </summary>
+	private static void ClearExcludeBlock( string repoRoot )
+	{
+		var path = Path.Combine( repoRoot, ".git", "info", "exclude" );
+		if ( !File.Exists( path ) ) return;
+
+		try
+		{
+			var kept = new List<string>();
+			var inBlock = false;
+			var found = false;
+
+			foreach ( var raw in File.ReadAllText( path ).Split( '\n' ) )
+			{
+				var line = raw.TrimEnd( '\r' );
+				if ( line == ExcludeHeader ) { inBlock = true; found = true; continue; }
+				if ( line == ExcludeFooter ) { inBlock = false; continue; }
+				if ( !inBlock ) kept.Add( line );
+			}
+
+			if ( !found ) return;
+
+			while ( kept.Count > 0 && kept[^1].Length == 0 ) kept.RemoveAt( kept.Count - 1 );
+			kept.Add( "" );
+			File.WriteAllText( path, string.Join( "\n", kept ) );
+		}
+		catch { }
+	}
+
 	private static void WriteExcludeBlock( string repoRoot, IReadOnlyList<string> relative )
 	{
 		var info = Path.Combine( repoRoot, ".git", "info" );
@@ -603,7 +675,7 @@ internal static class CaseAliases
 
 	// ---- path helpers ----------------------------------------------------
 
-	private static bool IsImage( string relative )
+	internal static bool IsImage( string relative )
 	{
 		var extension = Path.GetExtension( relative );
 		foreach ( var candidate in ImageExtensions )
@@ -616,7 +688,7 @@ internal static class CaseAliases
 	/// Where a symlink points, as an absolute path, or null when the path is not
 	/// a link. Works for dangling links and for links to directories.
 	/// </summary>
-	private static string? LinkTargetAbsolute( string path )
+	internal static string? LinkTargetAbsolute( string path )
 	{
 		try
 		{
@@ -650,6 +722,30 @@ internal static class CaseAliases
 		return SamePath( Path.Combine( root, lower ), linkPath );
 	}
 
+	/// <summary>
+	/// True when the path is still the link the journal recorded: a symlink
+	/// inside the checkout pointing at the exact file it was made for. A link
+	/// that now points elsewhere - a hand-made override, a retarget after the
+	/// file moved - is not ours and is left alone.
+	/// </summary>
+	private static bool LooksLikeRecorded( string repoRoot, string linkPath, string recordedTarget )
+	{
+		var current = LinkTargetAbsolute( linkPath );
+		if ( current is null ) return false;
+		if ( !IsUnder( repoRoot, linkPath ) || !IsUnder( repoRoot, current ) ) return false;
+
+		var expected = Path.GetFullPath( Path.Combine( repoRoot, recordedTarget ) );
+		if ( !IsUnder( repoRoot, expected ) ) return false;
+
+		return SamePath( current, expected );
+	}
+
+	private static bool IsUnder( string root, string path )
+	{
+		var relative = Path.GetRelativePath( root, path );
+		return relative != ".." && !relative.StartsWith( ".." + Path.DirectorySeparatorChar, StringComparison.Ordinal );
+	}
+
 	private static bool IsUnderAnyRoot( IReadOnlyList<string> roots, string path, out string root )
 	{
 		foreach ( var candidate in roots )
@@ -668,7 +764,7 @@ internal static class CaseAliases
 
 	private static string RepoRelative( string repoRoot, string path ) => Path.GetRelativePath( repoRoot, path );
 
-	private static bool SamePath( string a, string b )
+	internal static bool SamePath( string a, string b )
 	{
 		var left = Path.GetFullPath( a ).TrimEnd( Path.DirectorySeparatorChar );
 		var right = Path.GetFullPath( b ).TrimEnd( Path.DirectorySeparatorChar );

@@ -172,11 +172,14 @@ Global toggles (persisted in settings, take effect on next launch):
   On Linux the content step needs it: the native model compiler opens FBX and
   child-model `.meta` references at the case they were authored with, and the
   engine content has several that only resolve on a case-insensitive
-  filesystem. Leave it off and Build S&Box reports those models as failed
-  (the build prints a hint saying so). Textures are covered separately by the
-  case aliases Build S&Box creates, which work either way. For a raw `sh Setup.sh` outside
-  Ampersand, put the shim in the environment yourself:
-  `LD_PRELOAD=~/.cache/sbox-ampersand/libcasefold.so sh Setup.sh`.
+  filesystem (without it citizen fails 4 assets and the run ends
+  `Content: Failed`). **Build S&Box always preloads the shim** - both
+  `ampersand --bootstrap` and `apps/build.sh` compile or reuse it - so this
+  toggle only decides whether launches get it too; if the shim cannot be built
+  the build says the content failure is not the checkout's. Textures are covered
+  separately by the case aliases Build S&Box creates, which work either way.
+  For a raw `sh Setup.sh` outside Ampersand, put the shim in the environment
+  yourself: `LD_PRELOAD=~/.cache/sbox-ampersand/libcasefold.so sh Setup.sh`.
 - **Input debug**: engine input diagnostics (`SBOX_INPUT_DEBUG`), so the flag
   no longer has to be in Ampersand's own environment at startup.
 
@@ -196,12 +199,46 @@ Ampersand passes it as `+game <value>`.
   itself lives in the terminal window. Before `Setup.sh` it also gives every
   wrongly-cased image source a lowercase symlink at its identity path, which
   is where the native content compiler opens textures from (see
-  **Remove case aliases**).
-- **Remove case aliases**: deletes the lowercase image symlinks Build S&Box
-  leaves in the s&box checkout (Linux only). The dialog shows how many first;
-  only links Ampersand made are removed - never tracked files, the engine's
-  own links or compiled outputs - and the next build recreates them. The same
-  one-shot operation is `ampersand --revert-case-aliases`.
+  **Remove case aliases**). It also refuses to start while a lowercase twin
+  directory shadows a shader include directory: the shader preprocessor
+  resolves `#include` through the twin and then only looks inside it, which is
+  how one such twin failed 47 of 105 shaders with a misleading
+  `file not found` while the include sat next to it. The preflight names the
+  twin, the directory it shadows and the include that will fail; **Repair**
+  (or `ampersand --repair-content-twins`) links the real includes into the twin
+  under both spellings, touching no compiled output, and the twin is checked
+  again after the build because the shader and content stages can create one.
+  The build takes an exclusive lock
+  (`<checkout>/.git/sbox-build.lock`, or the checkout root when `.git` is a
+  file as in a worktree) for its whole run, so a second build -
+  the GUI, `apps/build.sh`, another terminal - reports that one is already
+  running instead of writing `game/bin/managed` behind it. The lock belongs to
+  the build process itself: the fd is close-on-exec (and `apps/build.sh`
+  closes it for its child), so the toolchain's long-lived MSBuild worker nodes
+  do not inherit it and cannot make the next build read as "already running".
+  It only covers builds Ampersand starts; a bare `dotnet build` of an engine or
+  test project, or `sh Setup.sh` itself, does not take it, so do not run either
+  while a build is in progress. If the launcher is killed while its `Setup.sh`
+  keeps running, the lock goes with the launcher: the managed record is already
+  invalidated then, so launches stay gated, but wait for the orphaned build
+  instead of starting a second one.
+  **Building that directory from two places at once can splice one assembly
+  from both compiles**: the build still reports success and the launcher then
+  dies two seconds into boot with `InvalidProgramException`. On success the
+  tree is fingerprinted (`<checkout>/.git/sbox-managed.json`), and every launch
+  checks it; a tree rewritten since - a Debug `dotnet build` of an engine or
+  test project, an interrupted build, `Setup.sh` by hand - is flagged before
+  the engine starts, with **Rebuild** / **Launch anyway**. Only an explicit
+  click on **Launch anyway** trusts the tree (and records it as verified);
+  dismissing the prompt cancels the launch. Launching is refused outright
+  while a build holds the lock.
+- **Remove case aliases**: deletes the case-compatibility symlinks Ampersand
+  leaves in the s&box checkout (Linux only) - texture sources linked at their
+  lowercased identity path, and shader includes linked into a shadowing twin.
+  The dialog shows how many first; only links Ampersand journaled are removed -
+  never tracked files, the engine's own links or compiled outputs - and the
+  next build or repair recreates them. The same one-shot operation is
+  `ampersand --revert-case-aliases`.
 - **Check for missing dependencies**: `ldd` sweep of
   `game/bin/linuxsteamrt64` plus the engine's bundled .NET runtime, on the
   **host and inside steamrt4**, plus the steamrt4 compat cache status. Runs via
@@ -226,9 +263,19 @@ binary inside your terminal emulator to keep SGR colour and column alignment:
 ```sh
 ampersand --dependency-check          # coloured host + container sweep
 ampersand --bootstrap [--skip-deps]   # engine Setup.sh + ldd report
-ampersand --case-aliases [--dry-run]  # prime the lowercase texture aliases
-ampersand --revert-case-aliases       # remove exactly those aliases
+ampersand --case-aliases [ROOT] [--dry-run]  # prime the lowercase texture aliases
+ampersand --content-twins [ROOT]      # report twins shadowing shader includes (exit 1 when unlinked)
+ampersand --repair-content-twins [ROOT] [--dry-run]  # link their includes; no compiled output is touched
+ampersand --revert-case-aliases [ROOT]  # remove exactly the links Ampersand made (both kinds)
+ampersand --record-managed [ROOT]     # mark game/bin/managed as verified after a manual build
 ```
+
+An unrecognised switch is an error (exit 2, with the list above), never a
+request to open the window. `apps/build.sh` calls the launcher beside it, so a
+`scripts/` directory copied over an older binary used to hand `--content-twins`
+to a launcher that did not know it - which opened a window in the middle of the
+build. The script now warns when the binary cannot answer and skips the check
+instead of reading the crash as "no twins".
 
 ## How it works
 
@@ -241,7 +288,10 @@ ampersand --revert-case-aliases       # remove exactly those aliases
   desktop-UI workarounds.
 - **The container is entered through Steam.** `SteamLauncherService` +
   `SteamRt4Runtime` refuse to build a container command unless the Steam client
-  is up, because only its launcher service may create the user namespace.
+  is up, because only its launcher service may create the user namespace. The
+  service is addressed by the name it actually registered: current clients
+  register one per instance (`…LaunchAlongsideSteam.Instance<pid>`) rather than
+  the bare name, so the dependency report names the instance it used.
   `SteamRt4Compat` seeds `libunwind` from the host on first
   containerised launch, plus best-effort `libpcre2-16.so.0` for the editor's
   Qt tools (steamrt4's platform omits it; a miss warns but never blocks).
@@ -263,8 +313,11 @@ SystemTerminal.cs       # emulator detection + per-emulator stay-attached flags,
 SteamRt4Runtime.cs      # find + validate the Steam Linux Runtime install
 SteamRt4Compat.cs       # libunwind + editor-only pcre2-16 shim cache for the container
 SteamLauncherService.cs # container entry through Steam's launcher service
-Bootstrap.cs            # Build S&Box: case aliases, engine Setup.sh + ldd report
+BuildLock.cs            # single-flight build lock (flock) shared with apps/build.sh
+ManagedTree.cs          # fingerprint of game/bin/managed, verified before every launch
+Bootstrap.cs            # Build S&Box: twin preflight, case aliases, engine Setup.sh + ldd report
 CaseAliases.cs          # lowercase image-source aliases for the Linux content build
+ContentTwins.cs         # shadowing shader-include twins: preflight, repair, shared journal
 DependencyCheck.cs      # host + container ldd sweep + shim report
 SboxSettings.cs         # persisted s&box path + server game (~/.local/share/…)
 RepoRoot.cs / AppPaths.cs / RunLog.cs / Ansi.cs / TerminalTheme.cs …
@@ -282,9 +335,15 @@ bootstrap.sh            # dev build shortcut (dotnet build -c Release)
 |---|---|
 | `Repo root not found` / stale-location warning | Pick a folder containing `game/` + `engine/` + `game/sbox`. The field accepts the root, `game/`, or the `game/sbox` file itself. |
 | `Steam Linux Runtime not installed` | `steam steam://install/4183110`, then start Steam and sign in. |
-| `Steam is not running` | Container entry goes through Steam's launcher service. Start the client first. |
+| `Steam's launcher service is not available` | Container entry goes through the service Steam starts alongside the client. Start Steam and wait for it to finish signing in. |
+| Launcher dies after `Warm render layers` with `InvalidProgramException`, exit 0, no stack | `game/bin/managed` was written by more than one build (Debug `dotnet build`, interrupted build, concurrent build) and one assembly is spliced. Run **Build S&Box** - the launch gate should already flag it - then launch again. Not an engine bug, and not the Steam runtime: it reproduces on the host. |
+| `another build is already running` | A build already holds `<checkout>/.git/sbox-build.lock`. Wait for it (or its terminal) to finish; two writers on `game/bin/managed` is the thing the lock exists to prevent. |
+| A launcher window opens while `apps/build.sh` runs, or the twin preflight reports `error: shader include directories are shadowed (see above)` with nothing above it | The `scripts/` copies are newer than the launcher binary beside them, so `--content-twins` reached a launcher that predates it and opened a window (headless: exits 134, which used to read as "twins found"). Current builds warn and skip the check; rebuild or reinstall ampersand next to the scripts. |
 | `HRESULT: 0x80008088` | Missing `libunwind` inside steamrt4. Run **Check for missing dependencies** and do one containerised launch to seed the shim cache. |
 | `No terminal emulator found` | Install one (`gnome-terminal`, `konsole`, `alacritty`, `kitty`, `foot`, `xterm`), or untick *Launch with system terminal* to run headless with log capture. |
 | AppImage won't run (`fuse` errors) | Install `fuse2`/`libfuse2`, or extract once: `./Ampersand-x86_64.AppImage --appimage-extract` and run `squashfs-root/AppRun`. |
 | Rebuild fails with `Text file busy` | The target AppImage is still running. Quit it and run `install-appimage.sh` again (the script checks for this first). |
 | Content build: `LoadFromFile` failed or a texture path cannot be found | The native compiler opens a texture by its lowercased identity path while sources keep their authored case (the lowercased tree only holds compiled outputs). Ampersand aliases the sources before every build; if they were removed, run **Build S&Box** or `ampersand --case-aliases`. `SBOX_SKIP_CASE_ALIASES=1` disables the alias pass. |
+| Shaders: many `fatal error: '…' file not found` (e.g. `'common/DDGI/DDGI.hlsl'`), or Build S&Box stops before `Setup.sh` with `content twins` | A lowercase twin directory (compiled `*_c` outputs) sits beside the mixed-case directory that holds the includes, so the preprocessor resolves `#include` through the twin and finds nothing. Not a missing file and not something the casefold shim can fix - it answers `open()` and this resolution never gets that far. Run **Build S&Box** (it offers **Repair**) or `ampersand --repair-content-twins`; `--revert-case-aliases` undoes it. `SBOX_SKIP_CONTENT_TWINS=1` skips only the check, not the breakage. |
+| Content build: `Error opening shader "weapons/physgun/physgun-screen.shader" … Feature combo not found` | A regenerated `.vmat` names its shader through a lowercased directory while the source keeps its case (`physgun/` vs `Physgun/`). `MaterialGenerator.BuildMaterialText` writes `shaderPath.NormalizeFilename( false )`, whose `enforceLowerCase` defaults to true, so every regenerated material for a shader in a mixed-case directory reintroduces it. Upstream fix (emit the authored spelling, or resolve the identity back to the source); do **not** work around it by writing shader outputs at the lowercased identity - that creates exactly the twin above and fails 47 shaders. |
+| Content build: citizen fails 4 assets, `Content: Failed`, nothing about case | The casefold shim was unavailable (no gcc, no prebuilt `libcasefold.so`). Setup says so before `Setup.sh`; install gcc or set `SBOX_CASEFOLD_SO` to a prebuilt shim. |

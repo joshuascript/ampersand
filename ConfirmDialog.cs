@@ -2,11 +2,23 @@ using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Primitives;
+using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Styling;
 
 namespace Ampersand;
+
+/// <summary>
+/// What a <see cref="ConfirmDialog.Choose"/> prompt resolved to. Dismissed is
+/// first on purpose: it is the value a dialog closed without a choice returns.
+/// </summary>
+internal enum ConfirmChoice
+{
+	Dismissed,
+	Confirm,
+	Alternate
+}
 
 /// <summary>
 /// A yes/no prompt, and the one-button notice built from the same parts. Hand-built
@@ -135,6 +147,71 @@ internal static class ConfirmDialog
 
 		dialog.Content = body;
 		return dialog.ShowDialog<bool>( owner );
+	}
+
+	/// <summary>
+	/// Two ways out plus "I changed my mind": the same prompt as <see cref="Show"/>,
+	/// but dismissing the window (Escape, the title bar) is reported separately
+	/// from clicking the second button. <see cref="Show"/> cannot tell them
+	/// apart, and a dialog whose second button does something irreversible must
+	/// not be reachable by reflex-dismissing it.
+	/// </summary>
+	public static Task<ConfirmChoice> Choose( Window owner, string title, string message, string confirm, string cancel )
+	{
+		var dialog = new Window
+		{
+			Title = title,
+			Icon = AppIcon.Icon,
+			Width = 460,
+			SizeToContent = SizeToContent.Height,
+			CanResize = false,
+			WindowStartupLocation = WindowStartupLocation.CenterOwner,
+			RequestedThemeVariant = ThemeVariant.Dark,
+			Background = TerminalTheme.ToolbarPanel
+		};
+
+		var confirmButton = new Button { Content = confirm, IsDefault = true };
+		confirmButton.Click += ( _, _ ) => dialog.Close( ConfirmChoice.Confirm );
+
+		// Deliberately not IsCancel: Escape must not be the same keystroke as
+		// choosing the second option. Escape closes the window instead (handled
+		// below), and a window closed without a choice returns the default,
+		// which is Dismissed.
+		var secondButton = new Button { Content = cancel };
+		secondButton.Click += ( _, _ ) => dialog.Close( ConfirmChoice.Alternate );
+
+		// Avalonia only routes Escape to a button with IsCancel, and neither
+		// button here is one, so the window would otherwise ignore it.
+		dialog.KeyDown += ( _, e ) =>
+		{
+			if ( e.Key == Key.Escape ) dialog.Close();
+		};
+
+		var buttons = new StackPanel
+		{
+			Orientation = Orientation.Horizontal,
+			Spacing = 8,
+			HorizontalAlignment = HorizontalAlignment.Right,
+			Margin = new Thickness( 0, 16, 0, 0 )
+		};
+		buttons.Children.Add( secondButton );
+		buttons.Children.Add( confirmButton );
+
+		var body = new StackPanel { Margin = new Thickness( 16 ) };
+		body.Children.Add( new TextBlock
+		{
+			Text = message,
+			TextWrapping = TextWrapping.Wrap,
+			Foreground = TerminalTheme.Normal,
+			FontSize = 12
+		} );
+		body.Children.Add( buttons );
+
+		dialog.Content = body;
+
+		// Dismissed is the default value, which is exactly what a window closed
+		// without pressing a button returns.
+		return dialog.ShowDialog<ConfirmChoice>( owner );
 	}
 
 	/// <summary>

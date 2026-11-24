@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -22,42 +23,136 @@ namespace Ampersand;
 /// Sent through this service the command runs as a child of Steam, whose profile
 /// is flags=(unconfined) and grants userns to its whole tree, so srt-bwrap
 /// succeeds on the first attempt and the fallback is never taken. Verified:
-/// `--alongside-steam -- cat /proc/self/attr/current` prints "steam (unconfined)".
+/// `--bus-name=<resolved> -- cat /proc/self/attr/current` reports the Steam
+/// profile, not the caller's.
 /// </summary>
 internal static class SteamLauncherService
 {
 	/// <summary>
-	/// The bus name that means "Steam is up and its launcher service is running".
-	/// Matched exactly: --list also reports org.freedesktop.portal.Flatpak, and a
-	/// per-instance suffix (...LaunchAlongsideSteam.Instance76066) which is not the
-	/// name to connect to.
+	/// The name older Steam clients register, and the prefix of the per-instance
+	/// name newer ones register instead. Never connect to it on the assumption it
+	/// is there - see <see cref="TryResolveBusName"/>.
 	/// </summary>
 	public const string BusName = "com.steampowered.PressureVessel.LaunchAlongsideSteam";
+
+	/// <summary>
+	/// The variable Steam puts in the environment of every process it starts,
+	/// holding the exact name of the launcher service belonging to the running
+	/// client. It is the first thing steam-runtime-launch-client's
+	/// --alongside-steam reads; a plain desktop session has no such variable.
+	/// </summary>
+	public const string AlongsideSteamVariable = "SRT_LAUNCHER_SERVICE_ALONGSIDE_STEAM";
+
+	private const string BusNameArgument = "--bus-name=";
+	private const string InstancePrefix = BusName + ".Instance";
 
 	/// <summary>
 	/// Whether the service is up. This is the authoritative test - `pgrep steam`
 	/// is not, because the client can be running while the service is not (an old
 	/// Steam build, or one still starting).
 	/// </summary>
-	public static bool IsAvailable( SteamRt4Install install )
+	public static bool IsAvailable( SteamRt4Install install ) =>
+		TryResolveBusName( install, out _ );
+
+	/// <summary>
+	/// Resolves the name the launcher service is actually reachable at. False
+	/// when no service belonging to a running Steam client is on the session bus.
+	///
+	/// The bare name is not enough any more. The current steamrt64 client starts
+	/// its service as
+	///   x86_64-linux-gnu-srt-launcher-service --alongside-steam
+	///       --bus-name=com.steampowered.PressureVessel.LaunchAlongsideSteam.Instance884065
+	/// and owns only that name - the bare one is not on the bus at all. A client
+	/// that launched us also exports the exact name as
+	/// SRT_LAUNCHER_SERVICE_ALONGSIDE_STEAM, which is what --alongside-steam
+	/// reads; without it (a plain desktop session) the flag falls back to the
+	/// bare name, finds nothing, and reports the service as down.
+	/// </summary>
+	public static bool TryResolveBusName( SteamRt4Install install, out string busName )
 	{
+		busName = BusName;
+
 		if ( !File.Exists( install.LaunchClient ) )
 			return false;
 
+		var inherited = Environment.GetEnvironmentVariable( AlongsideSteamVariable );
+
+		// Ask which names are on the bus instead of connecting: --alongside-steam
+		// would try the inherited name (absent here) and then the bare one (not
+		// registered), and its "unable to connect" is indistinguishable from
+		// Steam being closed.
 		if ( !Run( new[] { install.LaunchClient, "--list" }, 5000, out var output ) )
-			return false;
+		{
+			// A client that cannot list still hands the name down to its children.
+			if ( string.IsNullOrEmpty( inherited ) )
+				return false;
+
+			busName = inherited;
+			return true;
+		}
+
+		var names = new List<string>();
 
 		foreach ( var line in output.Split( '\n' ) )
 		{
-			if ( line.Trim() == "--bus-name=" + BusName )
-				return true;
+			var trimmed = line.Trim();
+
+			if ( !trimmed.StartsWith( BusNameArgument, StringComparison.Ordinal ) )
+				continue;
+
+			var name = trimmed.Substring( BusNameArgument.Length );
+
+			// Only exact launcher names. --list also reports
+			// org.freedesktop.portal.Flatpak, and a prefix match would take
+			// ...LaunchAlongsideSteam.Anything for the service itself.
+			if ( name == BusName || name.StartsWith( InstancePrefix, StringComparison.Ordinal ) )
+				names.Add( name );
 		}
 
-		return false;
+		if ( names.Count == 0 )
+			return false;
+
+		// The service of the client that started this process, if there is one.
+		// Verified against the bus because a client restart leaves the inherited
+		// name pointing at a service that has gone away.
+		if ( !string.IsNullOrEmpty( inherited ) && names.Contains( inherited ) )
+		{
+			busName = inherited;
+			return true;
+		}
+
+		// A client that also registers the bare name means that one by
+		// "alongside Steam", so prefer it.
+		if ( names.Contains( BusName ) )
+			return true;
+
+		// Otherwise each client instance registered its own name. Usually one;
+		// after a client restart the old service can linger, so take the highest
+		// PID - the client the user just started.
+		busName = names[0];
+		var newest = -1;
+
+		foreach ( var name in names )
+		{
+			var number = int.TryParse( name.Substring( InstancePrefix.Length ), out var pid ) ? pid : -1;
+			if ( number > newest )
+			{
+				newest = number;
+				busName = name;
+			}
+		}
+
+		return true;
 	}
 
 	/// <summary>
 	/// Prefixes a command so the service runs it.
+	///
+	/// Connects by resolved name rather than --alongside-steam: see
+	/// <see cref="TryResolveBusName"/>. Resolution is repeated here rather than
+	/// handed in because every caller would otherwise have to pair the two calls
+	/// correctly, and a probe is one short exec. Falls back to the bare name when
+	/// nothing resolves, so the failure is the client's own "unable to connect".
 	///
 	/// The environment MUST be passed explicitly. The child inherits the SERVICE's
 	/// environment - Steam's - and not the caller's; that is what --pass-env exists
@@ -80,7 +175,9 @@ internal static class SteamLauncherService
 		string workingDirectory,
 		IReadOnlyDictionary<string, string> environment )
 	{
-		var wrapped = new List<string> { install.LaunchClient, "--alongside-steam" };
+		var busName = TryResolveBusName( install, out var resolved ) ? resolved : BusName;
+
+		var wrapped = new List<string> { install.LaunchClient, BusNameArgument + busName };
 
 		// The service's own cwd otherwise, which is wherever Steam was started.
 		if ( !string.IsNullOrEmpty( workingDirectory ) )

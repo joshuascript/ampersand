@@ -20,10 +20,16 @@ namespace Ampersand;
 /// in DependencyCheck) as ampersand-specific value. Launched from the sidebar
 /// in a real terminal (Program.BootstrapArgument) with SGR colour.
 /// </para>
+/// <para>
+/// Returns 0 when the build finished, 1 when it stopped early - a failed
+/// stage, or a preflight that refused to start (a running build, a shadowing
+/// shader-include twin). The GUI ignores the code (the terminal is the
+/// report); <c>--bootstrap</c> forwards it so scripts can tell.
+/// </para>
 /// </summary>
 internal static class Bootstrap
 {
-	public static void Run( string repoRoot, Action<string> emit, bool skipDeps = false )
+	public static int Run( string repoRoot, Action<string> emit, bool skipDeps = false )
 	{
 		emit( Ansi.Bold + Ansi.White + "=== build s&box ===" + Ansi.NoBold + Ansi.Reset );
 		emit( Ansi.Dim + "repo  " + Ansi.Reset + repoRoot );
@@ -34,15 +40,92 @@ internal static class Bootstrap
 		{
 			emit( Ansi.Red + "  Setup.sh not found: " + setupSh + Ansi.Reset );
 			emit( Ansi.Dim + "  This checkout predates the engine's Setup.sh workflow - pull sbox-public first." + Ansi.Reset );
-			return;
+			return 1;
 		}
 
 		if ( Which( "dotnet" ) is null )
 		{
 			emit( Ansi.Red + "  dotnet not on PATH - cannot run Setup.sh." + Ansi.Reset );
 			emit( Ansi.Dim + "  Install .NET 10 SDK: https://dotnet.microsoft.com/download" + Ansi.Reset );
-			return;
+			return 1;
 		}
+
+		// --- shader include twins ---------------------------------------------
+		// The content build publishes compiled outputs into lowercased paths, so
+		// a lowercase directory can sit beside the authored shader directory
+		// that holds the includes. The preprocessor resolves an #include through
+		// that twin and then only looks inside it, which is how one empty twin
+		// failed 47 of 105 shaders with a misleading "file not found" while the
+		// include was sitting next to it. Checked before the lock and before the
+		// verified tree is invalidated: nothing has been written yet, so a stop
+		// here must not cost the user a rebuild prompt.
+		var twins = ContentTwins.Scan( repoRoot );
+		if ( twins.Skipped )
+		{
+			emit( Ansi.Dim + "  " + twins.Describe() + Ansi.Reset );
+		}
+		else
+		{
+			// A partial scan is not a clean one: say so rather than let an
+			// unreadable directory look like "nothing to report".
+			if ( twins.Unreadable > 0 )
+			{
+				emit( Ansi.Yellow + $"  content twins: {twins.Unreadable} directories could not be read -"
+					+ " the check is incomplete" + Ansi.Reset );
+			}
+
+			if ( twins.HasUnrepaired )
+			{
+				var unrepaired = twins.Unrepaired;
+				emit( Ansi.Red + "  content twins: " + unrepaired.Count + " lowercased director"
+					+ ( unrepaired.Count == 1 ? "y shadows" : "ies shadow" ) + " a shader include directory" + Ansi.Reset );
+
+				foreach ( var line in ContentTwins.Explain( repoRoot, twins ) )
+					emit( Ansi.Red + "  " + line + Ansi.Reset );
+
+				emit( "" );
+				emit( Ansi.Dim + "  Shader includes are resolved by the engine's own directory walker, not by open(), so the"
+					+ " casefold shim cannot rescue them." + Ansi.Reset );
+				emit( Ansi.Dim + "  Repair links the real include files into the twin under both spellings - no compiled"
+					+ " output is touched:" + Ansi.Reset );
+				emit( "  ampersand " + Program.RepairContentTwinsArgument + "   " + Ansi.Dim
+					+ "(or " + Program.ContentTwinsArgument + " to list; revert with " + Program.RevertCaseAliasesArgument + ")" + Ansi.Reset );
+				emit( "" );
+				emit( Ansi.Dim + "  The build did not start and game/bin/managed was not touched." + Ansi.Reset );
+				return 1;
+			}
+		}
+
+		// --- single-flight build ---------------------------------------------
+		// Setup.sh deletes and repopulates game/bin/managed, and any other
+		// build in this checkout writes the same files. Two of them at once can
+		// splice one assembly from both compiles, which is how a launcher ends
+		// up dying with InvalidProgramException on its next boot. See BuildLock.
+		var buildLock = BuildLock.TryAcquire( repoRoot, out var lockProblem, out var busy );
+		if ( buildLock is null )
+		{
+			emit( Ansi.Red + "  " + ( busy ? "another build is already running" : "cannot start the build" ) + Ansi.Reset );
+			emit( Ansi.Dim + "  " + lockProblem + Ansi.Reset );
+
+			if ( busy )
+			{
+				emit( Ansi.Dim + "  wait for it to finish, then run this again - building now would put a"
+					+ " second writer on game/bin/managed" + Ansi.Reset );
+			}
+
+			return 1;
+		}
+
+		// Held to the end of the run, report included: the point is that no
+		// other build starts while this one is still finishing, and the report
+		// is seconds.
+		using var held = buildLock;
+		emit( Ansi.Dim + "  build lock: " + BuildLock.PathFor( repoRoot ) + Ansi.Reset );
+
+		// From here the managed tree is about to be rewritten. Forget what was
+		// verified first, so a Ctrl-C or a failed step leaves it unverified and
+		// the next launch rebuilds instead of trusting half a build.
+		ManagedTree.Invalidate( repoRoot );
 
 		// --- toolchain exec bits (fresh downloads lose them) ------------------
 		// The GUI prompts before launching; this silent re-check covers direct
@@ -72,17 +155,17 @@ internal static class Bootstrap
 
 		// --- engine setup (heavy lifting lives here) --------------------------
 		emit( Ansi.Bold + Ansi.Cyan + "--- sh Setup.sh ---" + Ansi.NoBold + Ansi.Reset );
-		// Case-insensitive asset fallback (opt-in Casefold toggle): export it
-		// around Setup.sh so the native content toolchain (contentbuilder and
-		// the resourcecompiler children it spawns) inherits it. The model
-		// compiler opens FBX/meta references at the case they were authored
-		// with, so without the shim the content step fails on the engine's
-		// wrong-case references. Warn-and-continue without it when the library
-		// cannot be built - setup itself must never hard-fail on the compat
-		// layer. The toggle stays optional; the hint below says what is at
-		// stake when it is off.
+
+		// Case-insensitive asset fallback, required for the build rather than
+		// opt-in: the model compiler opens FBX and child-model .meta references
+		// at the case they were authored with, and the engine content has
+		// several that only resolve on a case-insensitive filesystem. Without
+		// the shim citizen fails 4 assets and the run ends "Content: Failed" for
+		// a reason that is nowhere in the checkout. The Casefold toggle only
+		// decides whether launches get the shim too, so this ignores it.
 		Dictionary<string, string>? setupEnv = null;
-		var casefoldSo = EnsureCasefoldLibrary( emit );
+		var casefoldSo = OperatingSystem.IsLinux() ? EnsureCasefoldLibrary( emit ) : null;
+		var shimMissing = OperatingSystem.IsLinux() && casefoldSo is null;
 		if ( casefoldSo is not null )
 		{
 			var existing = Environment.GetEnvironmentVariable( "LD_PRELOAD" );
@@ -92,11 +175,6 @@ internal static class Bootstrap
 			};
 			emit( Ansi.Dim + "  casefold shim: " + casefoldSo + Ansi.Reset );
 		}
-		else if ( OperatingSystem.IsLinux() )
-		{
-			emit( Ansi.Dim + "  casefold: off - wrong-case FBX references in the engine content will fail the"
-				+ " content step (tick Casefold to enable the shim)" + Ansi.Reset );
-		}
 		// Via sh, not ./. : Setup.sh is stored without the exec bit upstream.
 		var setupCode = RunProcess( "sh", new[] { "Setup.sh" }, repoRoot, emit, setupEnv );
 		emit( "" );
@@ -105,11 +183,42 @@ internal static class Bootstrap
 		{
 			emit( Ansi.Red + $"  setup failed (exit {setupCode})" + Ansi.Reset );
 			emit( Ansi.Dim + "  Rerun with --verbose output: sh Setup.sh --verbose (in the checkout)." + Ansi.Reset );
-			return;
+			emit( Ansi.Dim + "  The managed tree stays unverified: the next launch will ask to rebuild"
+				+ " rather than trust a half-written build." + Ansi.Reset );
+
+			if ( shimMissing )
+			{
+				emit( Ansi.Yellow + "  Note: the casefold shim was unavailable for this run. Without it the content"
+					+ " step fails on the engine's wrong-case asset references (citizen: 4 assets) for reasons that"
+					+ " are not in this checkout - fix the shim before treating this as a content bug." + Ansi.Reset );
+			}
+
+			return 1;
 		}
+
+		// The build owns game/bin/managed again. Fingerprint it now, so a
+		// second writer afterwards (a Debug dotnet build, Setup.sh by hand) is
+		// caught at the next launch instead of surfacing as a mystery crash.
+		ManagedTree.Record( repoRoot, line => emit( Ansi.Dim + "  " + line + Ansi.Reset ) );
 
 		emit( Ansi.Green + "  setup OK" + Ansi.Reset );
 		emit( "" );
+
+		// The content and shader stages write lowercased directories, so a twin
+		// can appear during the run that was not there when it started. The
+		// build itself succeeds; the next shader compile is what fails, so say
+		// so now instead of letting the user find 47 "file not found" errors.
+		var afterBuild = ContentTwins.Scan( repoRoot );
+		if ( !afterBuild.Skipped && afterBuild.HasUnrepaired )
+		{
+			emit( Ansi.Red + "  content twins appeared during the build: the next shader compile will fail" + Ansi.Reset );
+			foreach ( var line in ContentTwins.Explain( repoRoot, afterBuild ) )
+				emit( Ansi.Red + "  " + line + Ansi.Reset );
+
+			emit( Ansi.Dim + "  repair now: ampersand " + Program.RepairContentTwinsArgument
+				+ " (links the real includes into the twin; deletes nothing)" + Ansi.Reset );
+			emit( "" );
+		}
 
 		if ( skipDeps )
 		{
@@ -132,6 +241,7 @@ internal static class Bootstrap
 		}
 
 		emit( Ansi.Bold + Ansi.White + "=== build done ===" + Ansi.NoBold + Ansi.Reset );
+		return 0;
 	}
 
 	private static int RunProcess( string exe, IReadOnlyList<string> args, string workDir, Action<string> emit, IReadOnlyDictionary<string, string>? extraEnv = null )
@@ -176,18 +286,14 @@ internal static class Bootstrap
 	/// <summary>
 	/// Ensures the case-insensitive asset fallback library exists, building
 	/// the vendored source (apps/patches/casefold.c) with gcc when needed.
-	/// Returns its path, or null (with a warning emitted) when the toggle is
-	/// off, gcc is missing, or the build fails - setup then proceeds without
-	/// the fallback rather than failing on the compat layer.
+	/// The build needs it on Linux regardless of the Casefold toggle (that
+	/// toggle is about launches), so there is no opt-out here. Returns its
+	/// path, or null when gcc is missing, no prebuilt copy exists, or the
+	/// build fails; the caller says what that means for the content step
+	/// rather than hard-failing setup on the compat layer.
 	/// </summary>
 	private static string? EnsureCasefoldLibrary( Action<string> emit )
 	{
-		bool enabled;
-		try { enabled = SboxSettings.GetCasefold(); }
-		catch { enabled = false; }
-		if ( !enabled )
-			return null;
-
 		var overrideSo = Environment.GetEnvironmentVariable( "SBOX_CASEFOLD_SO" );
 		var so = string.IsNullOrWhiteSpace( overrideSo ) ? AppPaths.CasefoldLibrary : overrideSo;
 		var src = AppPaths.FindCasefoldSource();
@@ -195,7 +301,10 @@ internal static class Bootstrap
 		{
 			// No source to compare against: a prebuilt copy is all there is.
 			if ( File.Exists( so ) ) return so;
-			emit( Ansi.Yellow + "  casefold: vendored source missing (scripts/patches/casefold.c) - continuing without the fallback" + Ansi.Reset );
+			emit( Ansi.Red + "  casefold: vendored source missing (scripts/patches/casefold.c) and no prebuilt shim at"
+				+ " " + so + Ansi.Reset );
+			emit( Ansi.Red + "  the content step will fail on wrong-case FBX references (citizen: 4 assets) for reasons"
+				+ " that are not in this checkout" + Ansi.Reset );
 			return null;
 		}
 		if ( File.Exists( so ) && AppPaths.IsShimUpToDate( src, so ) )
@@ -219,21 +328,25 @@ internal static class Bootstrap
 			using var proc = Process.Start( psi );
 			if ( proc is null )
 			{
-				emit( Ansi.Yellow + "  casefold: could not start gcc - continuing without the fallback" + Ansi.Reset );
+				emit( Ansi.Red + "  casefold: could not start gcc, and no prebuilt shim exists" + Ansi.Reset );
+				emit( Ansi.Red + "  the content step will fail on wrong-case FBX references (citizen: 4 assets) for reasons"
+					+ " that are not in this checkout" + Ansi.Reset );
 				return null;
 			}
 			var output = proc.StandardOutput.ReadToEnd() + "\n" + proc.StandardError.ReadToEnd();
 			proc.WaitForExit();
 			if ( proc.ExitCode != 0 || !File.Exists( so ) )
 			{
-				emit( Ansi.Yellow + $"  casefold: gcc failed (exit {proc.ExitCode}) - continuing without the fallback" + Ansi.Reset );
+				emit( Ansi.Red + $"  casefold: gcc failed (exit {proc.ExitCode}); the content step will fail on wrong-case"
+					+ " FBX references for reasons that are not in this checkout" + Ansi.Reset );
 				emit( Ansi.Dim + "  " + output.Trim().Replace( "\n", "\n  " ) + Ansi.Reset );
 				return null;
 			}
 		}
 		catch ( Exception e )
 		{
-			emit( Ansi.Yellow + "  casefold: build failed (" + e.Message + ") - continuing without the fallback" + Ansi.Reset );
+			emit( Ansi.Red + "  casefold: build failed (" + e.Message + "); the content step will fail on wrong-case"
+				+ " FBX references for reasons that are not in this checkout" + Ansi.Reset );
 			return null;
 		}
 

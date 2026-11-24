@@ -85,8 +85,9 @@ internal static class AppPaths
 
 	/// <summary>
 	/// Default location of the built case-insensitive asset fallback library
-	/// (wrong-case FBX references committed upstream; opt-in Casefold toggle,
-	/// off by default). Same cache-dir/on-demand arrangement as above.
+	/// (wrong-case FBX references committed upstream). Build S&Box always
+	/// compiles and preloads it; the Casefold toggle only decides whether
+	/// launches get it too. Same cache-dir/on-demand arrangement as above.
 	/// Overridable with SBOX_CASEFOLD_SO.
 	/// </summary>
 	public static string CasefoldLibrary => Path.Combine( CacheDir, "libcasefold.so" );

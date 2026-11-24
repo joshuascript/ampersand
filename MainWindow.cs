@@ -214,9 +214,11 @@ internal sealed class MainWindow : Window
 		};
 		ToolTip.SetTip( casefoldFix, "Case-insensitive fallback for wrong-case asset references:\n"
 			+ "retries failed file opens matching each path component\n"
-			+ "case-insensitively (fixes Linux content builds and asset loads\n"
-			+ "for upstream files with lowercase FBX paths).\n"
-			+ "Takes effect on next launch. Dormant unless ticked.\n"
+			+ "case-insensitively (fixes asset loads for upstream files with\n"
+			+ "lowercase FBX paths).\n"
+			+ "Build S&Box always uses it - the content step needs it either way -\n"
+			+ "so this toggle only affects launches.\n"
+			+ "Takes effect on next launch. Dormant for launches unless ticked.\n"
 			+ "Diagnostics with CASEFOLD_VERBOSE=1." );
 		casefoldFix.IsCheckedChanged += async ( _, _ ) =>
 		{
@@ -356,9 +358,10 @@ internal sealed class MainWindow : Window
 		revertAliasesButton.IsEnabled = OperatingSystem.IsLinux();
 		revertAliasesButton.Click += ( _, _ ) => RemoveCaseAliases();
 		ToolTip.SetTip( revertAliasesButton,
-			"Delete the lowercase image symlinks Ampersand creates before a build so the "
-			+ "Linux content compiler can find textures. Only those symlinks are removed - "
-			+ "nothing tracked is touched - and the next build recreates them." );
+			"Delete the case-compatibility symlinks Ampersand creates so the Linux build can "
+			+ "resolve lowercased paths: texture sources for the content compiler, and shader "
+			+ "includes for a shadowing twin directory. Nothing tracked is touched, and the "
+			+ "next build or repair recreates them." );
 
 		logFolderButton = SidebarButton( "Open log folder" );
 		logFolderButton.Click += ( _, _ ) => OpenLogFolder();
@@ -661,6 +664,20 @@ internal sealed class MainWindow : Window
 			return;
 		}
 
+		// Refuse to start an engine whose managed tree nobody can vouch for.
+		// See ManagedTree: a tree written by two builds at once passes every
+		// file check and still dies with InvalidProgramException two seconds
+		// into boot, which is expensive to diagnose and cheap to prevent.
+		if ( !await EnsureManagedTreeAsync( root ) )
+			return;
+
+		// Content half of the same trust question, checked after the binaries
+		// and before the engine starts: a lowercased twin beside a shader
+		// include directory makes the next shader compile resolve an #include
+		// into the twin and fail with "file not found". See ContentTwins.
+		if ( !await ConfirmContentTwinsAsync( root, build: false ) )
+			return;
+
 		// Case-insensitive asset fallback shim: same build-on-demand
 		// arrangement. Covers game/editor scripts via _common.sh; sbox-server
 		// is standalone and skips it like the other shims.
@@ -811,10 +828,15 @@ internal sealed class MainWindow : Window
 		// the freeze, not remove it.
 		if ( !await Task.Run( () => SteamLauncherService.IsAvailable( install ) ) )
 		{
-			await Fail( target, "Steam is not running",
+			// Named after the service, not the client: the probe looks for the
+			// service the client starts alongside itself, and saying "Steam is
+			// not running" to someone staring at a running client sends them
+			// after the wrong thing.
+			await Fail( target, "Steam's launcher service is not available",
 				"s&box can only be launched in the Steam runtime while the Steam client is "
-					+ "running - the container is entered through Steam's own launcher service.\n\n"
-					+ "Start Steam, wait for it to sign in, then try again." );
+					+ "running and signed in - the container is entered through the launcher "
+					+ "service the client starts alongside itself.\n\n"
+					+ "Start Steam, wait for it to finish signing in, then try again." );
 			return false;
 		}
 
@@ -878,6 +900,197 @@ internal sealed class MainWindow : Window
 		return true;
 	}
 
+	/// <summary>
+	/// True when it is safe to start the engine: the managed tree matches the
+	/// last build Ampersand finished, or the user chose to trust what is there.
+	///
+	/// The failure this exists for does not look like a build problem when it
+	/// happens. game/bin/managed is written by the engine's build step and by
+	/// every engine project's output path, so a Debug dotnet build, an
+	/// interrupted build or two builds at once can leave one assembly spliced
+	/// from two compilations. The build still reports success; the launcher dies
+	/// ~2s into boot with InvalidProgramException, exit 0 and no stack, right
+	/// after "Warm render layers". Rebuilding is the fix, and catching it here
+	/// costs a directory listing and one hash.
+	/// </summary>
+	private async Task<bool> EnsureManagedTreeAsync( string root )
+	{
+		// A build in flight owns game/bin/managed and has already deleted the
+		// record on purpose. The lock is the only thing that separates that from
+		// "never built": without the probe, the window where the build has
+		// cleared the directory reads as Absent and launches into an empty tree,
+		// and the rest of the build reads as Unknown and offers to bless a
+		// half-written one. Acquire-then-release so the probe holds nothing.
+		var probe = BuildLock.TryAcquire( root, out _, out var buildRunning );
+		probe?.Dispose();
+
+		if ( buildRunning )
+		{
+			await ConfirmDialog.Notify( this, "A build is running",
+				"Ampersand is building game/bin/managed right now, so the tree stays unverified "
+					+ "until that build finishes.\n\n"
+					+ "Wait for the build terminal to close, then launch." );
+			return false;
+		}
+
+		ManagedTreeCheck check;
+
+		try
+		{
+			check = await Task.Run( () => ManagedTree.Check( root ) );
+		}
+		catch
+		{
+			// A gate that cannot read the tree must not block launching it.
+			return true;
+		}
+
+		if ( check.State is ManagedTreeState.Verified or ManagedTreeState.Absent )
+			return true;
+
+		var changed = check.State == ManagedTreeState.Changed;
+
+		var detail = changed
+			? "game/bin/managed no longer matches the last build Ampersand verified:\n\n"
+				+ check.Detail
+				+ "\n\nSomething else wrote this checkout - a Debug dotnet build of an engine or test"
+				+ " project, a build that was interrupted, or Setup.sh run by hand. Two builds on that"
+				+ " directory at once can leave one assembly spliced from both compiles. It passes"
+				+ " every file check, and then the launcher dies two seconds into boot with"
+				+ " \"InvalidProgramException\"."
+			: "Ampersand has no record of a verified build of game/bin/managed for this checkout:\n\n"
+				+ check.Detail
+				+ "\n\nIt cannot tell whether one build wrote that directory or several, and a spliced"
+				+ " assembly only shows up as \"InvalidProgramException\" when the launcher boots."
+				+ "\n\nIf you built this tree yourself and trust it, launch anyway - that records the"
+				+ " tree as verified.";
+
+		var choice = await ConfirmDialog.Choose( this, "Managed tree not verified",
+			detail + "\n\nRebuild now? It runs in a terminal window and takes a few minutes.",
+			"Rebuild", "Launch anyway" );
+
+		switch ( choice )
+		{
+			case ConfirmChoice.Confirm:
+				// Same terminal build as the sidebar button; the launch is
+				// abandoned rather than queued, because the tree is about to be
+				// replaced.
+				RunBootstrap( skipDeps: false );
+				return false;
+
+			case ConfirmChoice.Alternate:
+				// An explicit click, not a dismissal: record the tree so the
+				// prompt does not come back on every launch.
+				if ( !ManagedTree.Record( root, line => statusText.Text = line ) )
+				{
+					await ConfirmDialog.Notify( this, "Could not record the tree",
+						"The launch continues, but ampersand could not write "
+							+ ManagedTree.RecordPath( root )
+							+ ".\n\nUntil it can, every launch will ask again." );
+				}
+
+				return true;
+
+			default:
+				// Dismissed: no decision was made, so nothing is launched and
+				// nothing is blessed.
+				statusText.Text = "launch cancelled - the managed tree is still unverified";
+				return false;
+		}
+	}
+
+	/// <summary>
+	/// The content half of the launch gate, and the build preflight's dialog:
+	/// a lowercase twin directory beside a shader include directory shadows
+	/// every <c>#include</c> that resolves through it (the preprocessor lists
+	/// the directory itself, so the casefold shim cannot rescue it). The repair
+	/// is additive - include links under both spellings - and journaled with
+	/// the image aliases, so **Remove case aliases** undoes it.
+	///
+	/// Returns true when there is nothing to fix or the user chose to go ahead;
+	/// a dismissal is a cancellation, like the managed-tree prompt. A build has
+	/// no override - its own preflight would refuse anyway - while a launch can
+	/// be forced, because the engine may not need to compile a shader.
+	/// </summary>
+	private async Task<bool> ConfirmContentTwinsAsync( string root, bool build )
+	{
+		ContentTwins.TwinScan scan;
+
+		try
+		{
+			scan = await Task.Run( () => ContentTwins.Scan( root ) );
+		}
+		catch
+		{
+			// A gate that cannot read the tree must not block the action, same
+			// as the managed-tree check above.
+			return true;
+		}
+
+		// Nothing to fix, or the check is off (non-Linux, or the escape hatch):
+		// no status line on a normal launch, the sidebar does not narrate. An
+		// incomplete scan is worth saying, though.
+		if ( scan.Skipped ) return true;
+		if ( scan.Unreadable > 0 ) statusText.Text = scan.Describe();
+		if ( !scan.HasUnrepaired ) return true;
+
+		var detail = string.Join( "\n", ContentTwins.Explain( root, scan ) )
+			+ "\n\nThe engine's shader preprocessor resolves an #include through the lowercased"
+			+ " directory and then only looks inside it, so the include is not found even though"
+			+ " the real directory sits right next to it. One such twin failed 47 of 105 shaders"
+			+ " with a misleading \"file not found\".\n\nRepairing links the real include files into"
+			+ " the twin, under both spellings. Nothing is deleted and no compiled output is touched.";
+
+		if ( build )
+		{
+			// No "build anyway": Bootstrap's own preflight refuses an unrepaired
+			// twin, so that button would only open a terminal that stops at once.
+			if ( !await ConfirmDialog.Show( this, "Shader includes shadowed",
+					detail + "\n\nRepair and build?", "Repair and build", "Cancel build" ) )
+			{
+				statusText.Text = "build cancelled - shader include directories are still shadowed";
+				return false;
+			}
+		}
+		else
+		{
+			// Launching is the user's call - the engine may not need to compile a
+			// shader - but it is never the default and never a dismissal.
+			var choice = await ConfirmDialog.Choose( this, "Shader includes shadowed",
+				detail + "\n\nRepair and launch?", "Repair", "Launch anyway" );
+
+			if ( choice == ConfirmChoice.Alternate )
+				return true;
+
+			if ( choice != ConfirmChoice.Confirm )
+			{
+				statusText.Text = "launch cancelled - shader include directories are still shadowed";
+				return false;
+			}
+		}
+
+		ContentTwins.RepairResult repaired;
+
+		try
+		{
+			repaired = await Task.Run( () => ContentTwins.Repair( root ) );
+		}
+		catch ( Exception e )
+		{
+			await ConfirmDialog.Notify( this, "Could not repair shader includes", e.Message );
+			return false;
+		}
+
+		statusText.Text = repaired.Describe();
+
+		var after = await Task.Run( () => ContentTwins.Scan( root ) );
+		if ( !after.HasUnrepaired ) return true;
+
+		await ConfirmDialog.Notify( this, "Shader includes still shadowed",
+			string.Join( "\n", ContentTwins.Explain( root, after ) )
+				+ "\n\nRepairing did not clear it - something is blocking the link paths above." );
+		return false;
+	}
 
 	/// The case-insensitive asset fallback needs its helper library built
 	/// (vendored source at apps/patches/casefold.c, built .so in the ampersand
@@ -1100,6 +1313,11 @@ internal sealed class MainWindow : Window
 				}
 			}
 
+			// A twin already in the tree fails the shader stage of the build, so
+			// offer the repair first instead of letting Setup.sh fail 47 shaders.
+			if ( !await ConfirmContentTwinsAsync( root, build: true ) )
+				return;
+
 			var args = new List<string> { self, Program.BootstrapArgument };
 			if ( skipDeps ) args.Add( "--skip-deps" );
 
@@ -1178,15 +1396,16 @@ internal sealed class MainWindow : Window
 			{
 				statusText.Text = "case aliases: none to remove";
 				await ConfirmDialog.Notify( this, "Nothing to remove",
-					"No case aliases created by Ampersand were found for this checkout.\n\n"
-						+ "They are made on Linux just before a build, so Build S&Box recreates "
-						+ "anything the content step needs." );
+					"No case-compatibility symlinks created by Ampersand were found for this "
+						+ "checkout.\n\nThey are made on Linux just before a build, so Build S&Box "
+						+ "recreates anything the content and shader steps need." );
 				return;
 			}
 
 			var confirmed = await ConfirmDialog.Show( this, "Remove case aliases",
-				$"{pending.Links} image symlinks that Ampersand created so the Linux content "
-					+ "build can resolve lowercased texture paths.\n\n"
+				$"{pending.Links} symlinks that Ampersand created so the Linux build can resolve "
+					+ "lowercased paths: texture sources for the content compiler, and shader "
+					+ "includes linked into a shadowing twin directory.\n\n"
 					+ "Only those symlinks are deleted - tracked files, the engine's own links and "
 					+ "compiled outputs stay as they are. A build running right now may fail while "
 					+ "its links disappear. The next build recreates them.",

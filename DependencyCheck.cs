@@ -107,20 +107,31 @@ internal static class DependencyCheck
 		emit( Ansi.Dim + "  version  " + Ansi.Reset + install.Version );
 
 		// The container is only reachable through Steam's launcher service, so with
-		// Steam down there is nothing to sweep - and saying so beats a wall of
-		// "not found" that looks like a broken install.
-		if ( !SteamLauncherService.IsAvailable( install ) )
+		// the service down there is nothing to sweep - and saying so beats a wall
+		// of "not found" that looks like a broken install.
+		if ( !SteamLauncherService.TryResolveBusName( install, out var busName ) )
 		{
-			emit( Ansi.Red + "  Steam is not running" + Ansi.Reset
-				+ " - the container is entered through Steam's launcher" );
-			emit( Ansi.Dim + "  service, so this half cannot be checked. Start Steam and run this again."
-				+ Ansi.Reset );
+			emit( Ansi.Red + "  Steam's launcher service is not available" + Ansi.Reset
+				+ " - the container is entered through it," );
+			emit( Ansi.Dim + "  so this half cannot be checked. Start Steam, wait for it to"
+				+ " sign in, then run this again." + Ansi.Reset );
 			emit( "" );
 			ReportShimCache( emit );
 			return;
 		}
 
-		emit( Ansi.Green + "  steam launcher service up" + Ansi.Reset );
+		// Which service was used, when it is not the bare name: current clients
+		// register a name per instance, and a mismatch here is otherwise
+		// invisible (it presents as Steam being closed).
+		// The name can also come from SRT_LAUNCHER_SERVICE_ALONGSIDE_STEAM when
+		// --list is unavailable, so slice only a name that really has the prefix.
+		var prefix = SteamLauncherService.BusName + ".";
+
+		var service = busName.StartsWith( prefix, StringComparison.Ordinal )
+			? Ansi.Dim + "  " + busName[prefix.Length..] + Ansi.Reset
+			: Ansi.Dim + "  " + busName + Ansi.Reset;
+
+		emit( Ansi.Green + "  steam launcher service up" + Ansi.Reset + service );
 
 		if ( !SteamRt4Runtime.CheckRequirements( install, out var problems ) )
 		{

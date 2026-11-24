@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using Avalonia;
 
 namespace Ampersand;
@@ -36,11 +37,52 @@ internal static class Program
 	public const string CaseAliasesArgument = "--case-aliases";
 
 	/// <summary>
-	/// Removes exactly the links <see cref="CaseAliasesArgument"/> created,
-	/// using Ampersand's own journal. The GUI exposes the same operation as the
-	/// sidebar's "Remove case aliases" tool.
+	/// Removes exactly the links <see cref="CaseAliasesArgument"/> and
+	/// <see cref="RepairContentTwinsArgument"/> created, using Ampersand's own
+	/// journal. The GUI exposes the same operation as the sidebar's "Remove
+	/// case aliases" tool.
 	/// </summary>
 	public const string RevertCaseAliasesArgument = "--revert-case-aliases";
+
+	/// <summary>
+	/// Reports lowercase twin directories that a shader <c>#include</c> can be
+	/// resolved into (the compiled-output twin shadowing the authored
+	/// directory). Read-only; exits 1 when one is not linked yet, which is what
+	/// the build preflight does before Setup.sh. See ContentTwins.
+	/// </summary>
+	public const string ContentTwinsArgument = "--content-twins";
+
+	/// <summary>
+	/// Links the real directory's shader includes into a shadowing twin, under
+	/// both spellings. Additive and journaled, so
+	/// <see cref="RevertCaseAliasesArgument"/> removes exactly those links.
+	/// </summary>
+	public const string RepairContentTwinsArgument = "--repair-content-twins";
+
+	/// <summary>
+	/// Marks game/bin/managed as verified. For a tree built outside Ampersand -
+	/// <c>SboxBuild build</c> by hand, or the engine's own Setup.sh - so the next
+	/// launch does not have to be told to trust it. Takes an optional repo path
+	/// (apps/build.sh passes one), otherwise the saved/derived root.
+	/// </summary>
+	public const string RecordManagedArgument = "--record-managed";
+
+	/// <summary>
+	/// Printed for --help and for an unrecognised switch. The GUI is the default
+	/// when there are no arguments, so an unknown switch - the case when a script
+	/// newer than the binary beside it passes a flag the binary predates - used
+	/// to open a window instead of failing. In a build script that window blocks
+	/// the build until it is closed, and closing it reads as success.
+	/// </summary>
+	private const string SupportedOptions =
+		"  --dependency-check               ldd sweep, host and steamrt4\n"
+		+ "  --bootstrap [--skip-deps]        build through the engine's Setup.sh\n"
+		+ "  --probe-distro [os-release]      distro detection, no side effects\n"
+		+ "  --case-aliases [ROOT] [--dry-run]\n"
+		+ "  --revert-case-aliases [ROOT] [--dry-run]\n"
+		+ "  --content-twins [ROOT]\n"
+		+ "  --repair-content-twins [ROOT] [--dry-run]\n"
+		+ "  --record-managed [ROOT]";
 
 	[STAThread]
 	private static int Main( string[] args )
@@ -55,6 +97,31 @@ internal static class Program
 			return CaseAliasesMain( args, revert: false );
 		if ( args.Length > 0 && args[0] == RevertCaseAliasesArgument )
 			return CaseAliasesMain( args, revert: true );
+		if ( args.Length > 0 && args[0] == ContentTwinsArgument )
+			return ContentTwinsMain( args, repair: false );
+		if ( args.Length > 0 && args[0] == RepairContentTwinsArgument )
+			return ContentTwinsMain( args, repair: true );
+		if ( args.Length > 0 && args[0] == RecordManagedArgument )
+			return RecordManagedMain( args );
+
+		// Anything else that looks like a switch is a mistake, not a request to
+		// open the window. Fail closed and say what exists: a GUI started by
+		// accident is either invisible (headless, exit 134) or blocks a script.
+		if ( args.Length > 0 && args[0].StartsWith( "-", StringComparison.Ordinal ) )
+		{
+			if ( args[0] is "--help" or "-h" )
+			{
+				Console.WriteLine( "ampersand - s&box launcher" );
+				Console.WriteLine( "usage: ampersand [--help]" );
+				Console.WriteLine( SupportedOptions );
+				return 0;
+			}
+
+			Console.Error.WriteLine( "ampersand: unknown option " + args[0] );
+			Console.Error.WriteLine( "supported:" );
+			Console.Error.WriteLine( SupportedOptions );
+			return 2;
+		}
 
 		return BuildAvaloniaApp().StartWithClassicDesktopLifetime( args );
 	}
@@ -94,13 +161,13 @@ internal static class Program
 			return 1;
 		}
 
-		Bootstrap.Run( root, Console.WriteLine, skipDeps );
+		var code = Bootstrap.Run( root, Console.WriteLine, skipDeps );
 
 		Console.WriteLine();
 		Console.Write( "Press Enter to close." );
 		Console.ReadLine();
 
-		return 0;
+		return code;
 	}
 
 	/// <summary>
@@ -111,10 +178,35 @@ internal static class Program
 	private static int CaseAliasesMain( string[] args, bool revert )
 	{
 		var dryRun = false;
+		string? explicitRoot = null;
 		for ( var i = 1; i < args.Length; i++ )
-			if ( args[i] == "--dry-run" ) dryRun = true;
+		{
+			if ( args[i] == "--dry-run" ) { dryRun = true; continue; }
+			if ( args[i].StartsWith( "-", StringComparison.Ordinal ) )
+			{
+				Console.Error.WriteLine( "ampersand: unknown option " + args[i] );
+				return 1;
+			}
 
-		var root = SboxSettings.Resolve() ?? RepoRoot.Find();
+			explicitRoot ??= args[i];
+		}
+
+		string? root;
+		if ( explicitRoot is not null )
+		{
+			if ( !Directory.Exists( Path.Combine( explicitRoot, "game" ) ) )
+			{
+				Console.Error.WriteLine( "ampersand: no game/ under " + explicitRoot );
+				return 1;
+			}
+
+			root = Path.GetFullPath( explicitRoot );
+		}
+		else
+		{
+			root = SboxSettings.Resolve() ?? RepoRoot.Find();
+		}
+
 		if ( root is null )
 		{
 			Console.Error.WriteLine( "ampersand: could not locate the repo root - expected game/ and engine/ above this binary" );
@@ -126,14 +218,116 @@ internal static class Program
 		{
 			var result = CaseAliases.Revert( root, Console.WriteLine, dryRun );
 			Console.WriteLine( result.Describe() );
+			return result.Skipped > 0 ? 1 : 0;
+		}
+
+		var aliases = CaseAliases.Ensure( root, Console.WriteLine, dryRun );
+		Console.WriteLine( aliases.Describe() );
+		return aliases.Conflicts > 0 ? 1 : 0;
+	}
+
+	/// <summary>
+	/// The twin preflight and its repair. No "Press Enter" hold: the preflight
+	/// runs inside builds and scripts, and the exit code is the answer.
+	/// </summary>
+	private static int ContentTwinsMain( string[] args, bool repair )
+	{
+		var dryRun = false;
+		string? explicitRoot = null;
+		for ( var i = 1; i < args.Length; i++ )
+		{
+			if ( args[i] == "--dry-run" ) { dryRun = true; continue; }
+			if ( args[i].StartsWith( "-", StringComparison.Ordinal ) )
+			{
+				Console.Error.WriteLine( "ampersand: unknown option " + args[i] );
+				return 1;
+			}
+
+			explicitRoot ??= args[i];
+		}
+
+		string? root;
+		if ( explicitRoot is not null )
+		{
+			// Same contract as --record-managed: a path that is not a checkout
+			// is a typo, not an invitation to fall back to the saved one.
+			if ( !Directory.Exists( Path.Combine( explicitRoot, "game" ) ) )
+			{
+				Console.Error.WriteLine( "ampersand: no game/ under " + explicitRoot );
+				return 1;
+			}
+
+			root = Path.GetFullPath( explicitRoot );
 		}
 		else
 		{
-			var result = CaseAliases.Ensure( root, Console.WriteLine, dryRun );
-			Console.WriteLine( result.Describe() );
+			root = SboxSettings.Resolve() ?? RepoRoot.Find();
+		}
+
+		if ( root is null )
+		{
+			Console.Error.WriteLine( "ampersand: could not locate the repo root - expected game/ and engine/ above this binary" );
+			Console.Error.WriteLine( "hint: set it in the launcher (Replace s&box path) or run from the repo checkout" );
+			return 1;
+		}
+
+		if ( repair )
+		{
+			var repaired = ContentTwins.Repair( root, Console.WriteLine, dryRun );
+			Console.WriteLine( repaired.Describe() );
+
+			// A repair that could not record its links leaves no revert path, so
+			// it is not a success even though the links work.
+			return repaired.Conflicts > 0 || !repaired.Journaled ? 1 : 0;
+		}
+
+		var scan = ContentTwins.Scan( root );
+		foreach ( var line in ContentTwins.Explain( root, scan ) )
+			Console.WriteLine( line );
+
+		Console.WriteLine( scan.Describe() );
+		if ( scan.Skipped )
+			return 0;
+
+		if ( scan.HasUnrepaired )
+		{
+			Console.WriteLine( "repair: ampersand " + RepairContentTwinsArgument + "  (adds include links; deletes nothing)" );
+			return 1;
 		}
 
 		return 0;
+	}
+
+	/// <summary>
+	/// No "Press Enter" hold: this is a one-shot helper for scripts.
+	/// </summary>
+	private static int RecordManagedMain( string[] args )
+	{
+		string? root = null;
+
+		if ( args.Length > 1 )
+		{
+			// An explicit path must be the tree, not a typo that silently falls
+			// back to whatever root the settings happen to hold.
+			if ( !Directory.Exists( args[1] ) )
+			{
+				Console.Error.WriteLine( "ampersand: no such directory: " + args[1] );
+				return 1;
+			}
+
+			root = Path.GetFullPath( args[1] );
+		}
+
+		root ??= SboxSettings.Resolve() ?? RepoRoot.Find();
+
+		if ( root is null || !Directory.Exists( Path.Combine( root, "game" ) ) )
+		{
+			Console.Error.WriteLine( "ampersand: could not locate the repo root - expected game/ and engine/ above this binary" );
+			Console.Error.WriteLine( "hint: ampersand " + RecordManagedArgument + " /path/to/sbox" );
+			return 1;
+		}
+
+		return ManagedTree.Record( root, Console.WriteLine ) ? 0 : 1;
 	}
 
 	private static int ProbeDistroMain( string[] args )
